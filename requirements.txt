@@ -1,0 +1,30 @@
+# mpv-live 的 Python 依赖（Windows / Python 3.13 实测过的组合）
+#
+# ── 手动准备的三样东西（不是 pip 包）──────────────────────────────
+#   1) mpv.exe            放到  mpv\mpv.exe
+#   2) vstrt.dll          VapourSynth 的 TensorRT 插件（提供 core.trt）
+#   3) anime4kcpp.dll     可选，Anime4KCPP 插件（提供 core.anime4kcpp）
+#   2)、3) 都放到  .venv\Lib\site-packages\vapoursynth\plugins\
+#   详见 README「依赖」一节。
+# ────────────────────────────────────────────────────────────────
+
+PySide6-Essentials==6.11.2
+shiboken6==6.11.2
+VapourSynth==77
+vapoursynth-mvtools==29
+numpy==2.5.3
+onnx==1.20.1
+onnxconverter-common==1.16.0
+pillow==12.3.0
+psutil==7.2.2
+imageio-ffmpeg==0.6.0
+
+# TensorRT —— 版本必须与本机 CUDA / 驱动匹配，下面只是本机验证过的组合。
+# 如果你的环境装不上 cu13 系，请按 NVIDIA 官方矩阵换成对应版本。
+tensorrt==11.3.0.99
+tensorrt-cu13==11.3.0.99
+tensorrt-cu13-bindings==11.3.0.99
+tensorrt-cu13-libs==11.3.0.99
+
+# 可选：音频设备 / 回环探测（只在排查音画同步时用到）
+sounddevice==0.5.6

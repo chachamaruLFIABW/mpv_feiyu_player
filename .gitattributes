@@ -1,0 +1,11 @@
+# 别让 git 做行尾/编码转换 —— 这个项目里有 GBK 编码的 .bat
+# （Windows 中文控制台要 chcp 936 才能正确显示，转成 UTF-8 会乱码）
+*.bat   -text
+*.cmd   -text
+*.ico   binary
+*.ttf   binary
+*.onnx  binary
+*.engine binary
+
+# 其余按文本处理，统一 LF
+* text=auto eol=lf

@@ -1,0 +1,37 @@
+# ───────────────────────────── Python 运行环境
+.venv/
+__pycache__/
+*.py[cod]
+
+# ───────────────────────────── mpv 二进制（自行下载，见 README）
+mpv/
+
+# ───────────────────────────── TensorRT 引擎
+# .engine 是**本机编译产物**：绑死 GPU 架构（sm_xx）与 TensorRT 版本，
+# 换台机器/换个 TRT 版本都得重新编 —— 所以不上传。
+# 用 build_fp16io_engines.py / build_aj_engines.py 在本机生成；
+# 或者干脆用 Anime4KCPP 插件路线（不需要 .engine，开箱可用）。
+models/**/*.engine
+models/**/*.engine.onnx
+
+# ───────────────────────────── 本机数据 / 用户配置
+# ⚠ ui_config.json 里存着播放列表的绝对路径（可能含私人目录），不要上传。
+ui_config.json
+bench_local.json
+测速结果.txt
+console_error.log
+*.lnk
+_cn_tmp/
+
+# ───────────────────────────── 诊断 / 测试临时产物
+_*.txt
+_*.log
+_*.png
+_*.mp4
+
+# ───────────────────────────── 本机截图
+# 这些截图里有本机播放列表（可能含不宜公开的片名），且部分是旧版 UI —— 不上传。
+# ⚠ 用 *.png 通配而不是写中文文件名：gitignore 里的中文 pattern 实测匹配不到
+#   （Windows 下文件名编码差异），写了等于没写。
+# 想放 README 配图的话，用一个干净的播放列表重新截图，再单独加进来。
+*.png
