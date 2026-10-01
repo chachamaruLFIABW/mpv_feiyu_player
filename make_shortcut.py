@@ -18,7 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 GUI = ROOT / "live_gui.py"
 LNK = ROOT / "实时播放器.lnk"
-ICO = ROOT / "player.ico"
+ICO = ROOT / "console.ico"
 
 
 def _pick_pythonw() -> Path:
@@ -37,10 +37,12 @@ PYW = _pick_pythonw()
 
 
 def make_icon() -> Path | None:
-    """画一个图标：深色圆角底 + 青色播放三角 + 右下角的放大箭头。
+    """优先用项目里的 console.ico（控制台图标）；没有才自绘一个兜底。
 
     （不如让快捷方式顶着 Python 的图标 —— 它是个播放器，不是脚本。）
     """
+    if ICO.is_file():
+        return ICO
     try:
         from PIL import Image, ImageDraw
     except Exception:

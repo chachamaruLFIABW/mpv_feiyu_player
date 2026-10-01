@@ -8,6 +8,18 @@
 
     LIVE_UPSCALE=1/0       超分开关                 默认 1
     LIVE_INTERP=1/0        补帧开关                 默认 1
+    LIVE_VFR=1/0           ★ 源是**可变帧率**（rmvb 这类「容器帧率造假」的）  默认 0
+                           =1 → **跳过 AssumeFPS、保留 mpv 给的原始逐帧时长**。
+                           为什么必须跳过：这类源容器头写的是 r_frame_rate
+                           （本机 D.Gray-man：写 30fps，真实平均 18.71fps），
+                           AssumeFPS 会把逐帧时长**拍平成恒定值** → 视频时间轴
+                           按假帧率走 → 与音频**持续漂移且累积**（实测 400 帧：
+                           不拍平 = 17.0s 真值 / 拍平 = 13.0s），而 avsync 恒 ≈0
+                           看不见（mpv 拿自己那套错的时间轴跟自己比）。
+                           代价：src.fps=0 → **补帧自动跳过**（补帧要恒定帧率），
+                           超分不受影响（实测跳过 AssumeFPS + TRT 超分 = 17.0s ✓）。
+                           ⚠ 判别由 GUI 的 `ProbeWorker._probe_vfr` 做（VS 构建期
+                             读帧只会拿到黑桩帧，拿不到真值）；正常 CFR 恒为 0。
     LIVE_ORDER=auto        处理顺序                 默认 auto
                            hr = 先超分后补帧；lr = 先补帧后超分；
                            auto = 源宽 ≥1280 且两者都开时用 lr，否则 hr
@@ -34,6 +46,24 @@
                              —— 且 estimated-vf-fps 照样报 48.0，**只看帧率会误判**。
                              ★ 1080p 要稳，**超分 / 补帧 二选一**（各 60s 窗全 0 丢帧）。
                              ⚠ 别用 12~14s 短窗判稳：临界配置短窗能出 0/0/1/1。
+    LIVE_SR_BUILD=1        按**源尺寸**现场编引擎                默认 1 = 开
+                           ★ 2026-10-02 新增。超分引擎是 fixed shape，旧做法是把
+                             任意源尺寸塞进固定档位表：2242x1080 的源宽超过所有
+                             档位（最大 1920）→ 落到 1920x1080 档 → **源先被压成
+                             1920x1080（横向 -14.4%）**，超分完再由 cap 非等比拉
+                             回来。最终几何虽对，但中间那次压缩是纯损失。
+                             本开关：源尺寸没有引擎时**就编一个该尺寸的**
+                             （实测 1280x720 = 14s / 2242x1080 = 11s，编完落盘
+                             缓存，之后同尺寸秒开）→ 源多大编多大，超分全程等比、
+                             零形变，连超分前那次 resize 都省了。
+                           ⚠ 代价：**首次**遇到新尺寸要等十几秒（日志会提示）。
+                           ⚠ 上限保护（任一命中就不现编，仍走档位老路）：
+                             · 短边 >1080（4K 级源）—— 那会编出 8K 输出，
+                               光超分实测就丢 98 帧/14s；
+                             · 4x 模型 —— 源×4 输出（2242x1080 → 8968x4320）；
+                             · 设了 LIVE_SR_MAX 且源尺寸超限 —— 尊重你的限档意图；
+                             · 短边 <128 —— 太小，没有超分意义。
+                           LIVE_SR_BUILD=0 = 完全恢复旧行为（只吃档位表）。
                              720p 源两者同开无压力，不受影响。
     LIVE_INTERP_FPS=auto   补帧倍率档（**源帧率 ×n**）  默认 auto
                            ★ 2026-09-30 改语义：从「绝对目标帧率」改成
@@ -57,6 +87,10 @@
     LIVE_RIFE_VER=4.26     RIFE 模型版本            默认 4.26
                            ★ 实测**版本对性能几乎没影响**（1080p 都在 3.2~4.4ms），
                              挑版本是白费功夫 —— 想换口味应该换下面的 LIVE_VFI。
+                           ★ 4.26 = RIFE 的**末代版本**（2024-09-21，作者 2025 年
+                             已明确说转做 LLM、不再更新）。网上流传的「4.6」是
+                             **更老**的版本，别把版本号大小当成新旧。
+                             本机 models/rife/ 只放了 4.26 与 4.25_lite 两个。
     LIVE_VFI=rife          补帧**引擎**（换算法，不是换模型版本）  默认 rife
                              rife   = vsmlrt C++ TensorRT（最快，占显存；
                                       平移镜头下有线条抖动/伪影）
@@ -223,6 +257,13 @@ ORDER = _env("LIVE_ORDER", "auto").lower()
 #     压到 13.1ms，让"只超分"更宽裕，但**救不活全链路**。
 #   720p 源两者同开毫无压力（0 丢帧），设不设都一样。
 SR_MAX = int(_env("LIVE_SR_MAX", "0") or 0)
+# ★ 2026-10-02：按**源尺寸**现场编引擎（详见文件头 env 表 LIVE_SR_BUILD）。
+#   解决的问题：档位表最大只到 1920x1080，2242x1080 这类非标准比例源会被压进
+#   1920x1080 档（横向 -14.4%），超分完再由 cap 非等比拉回来。
+SR_BUILD = _flag("LIVE_SR_BUILD", True)
+#   门禁常量（判据在 `_may_build_src_engine` 里，运行时才拿得到 SR_NATIVE_SCALE）：
+_SR_BUILD_MIN_EDGE = 128      # 短边下限：比这还小就没必要超分
+_SR_BUILD_MAX_EDGE = 1080     # 短边上限：4K 级源按源尺寸编会产出 8K 帧，光超分就丢帧
 # ★ 2026-10-01：上限的**判据边**（short = 短边 / long = 长边）。
 #   「按短边」= 原来的行为（1080p 源填 1080 → 挑 1920x1080 档）。
 #   「按长边」= 直接填想限的**宽度**（填 1920 → 同样挑到 1920x1080 档），
@@ -586,7 +627,11 @@ def pick_ladder(w: int, h: int) -> tuple[int, int]:
 
     优先级：① 宽高比接近（±5%）且宽度不小于源 → 取最窄的；
             ② 退而求其次：只要宽度不小于源 → 取最窄的；
-            ③ 都不满足（源比所有档都大）→ 用最大档（会先降采样，损失可接受）。
+            ③ 都不满足（源比所有档都大）→ 挑**宽高比最接近**的档（会先降采样，
+               损失可接受）；比例一样才比面积。
+               ⚠ ③ **不能按面积挑**：`LIVE_SR_BUILD` 现编出来的档位也会进 LADDER，
+                 2242x1080（比例 2.076）的面积大于 1920x1080，一旦按面积挑，
+                 16:9 的 4K 源会被它抢走并横向拉伸 1.168 倍（2026-10-02 实测踩到）。
 
     ★ SR_MAX 是「档位像素上限」（LIVE_SR_MAX，按**短边**判）：命中时**先砍档位集合**
       再走上面的优先序。为什么需要它：超分成本 ~正比于档位像素数，
@@ -622,7 +667,21 @@ def pick_ladder(w: int, h: int) -> tuple[int, int]:
         cands = [t for t in pool if t[0] >= w]
     if cands:
         return min(cands, key=lambda t: t[0] * t[1])
-    return max(pool, key=lambda t: t[0] * t[1])
+    # ③ 源比所有档都宽 → 在**比例接近**的档里取**面积最大**的那个。
+    #   ⚠ 两个坑都踩过（2026-10-02）：
+    #     · 按面积挑 → 现编的 2242x1080（比例 2.076，面积 2.42M）会把 16:9 的 4K 源
+    #       抢走并横向拉伸 1.168 倍；
+    #     · 按"绝对偏差最小"挑 → 854x480(1.7792) 对 2.076 的偏差 0.2968 比
+    #       1280x720(1.7778) 的 0.2981 只小 0.0014，降档时会白白选到小档、白丢画质。
+    #   ⇒ 先用 5% 相对容差把"比例差不多"的档圈出来，再在里面取面积最大的。
+    #     （比例完全一致时 dmin=0 → 退化成"只看比例"，正是 4K 源要的行为。）
+    _d = [abs(t[0] / t[1] - ar) for t in pool]
+    #   容差下限取 **ar 的 1%**：640x360(1.7778) / 1280x720(1.7778) / 854x480(1.7792)
+    #   这种"同为 16:9 的几个档"必须算作同一比例档 —— 否则会为了 0.0014 的偏差
+    #   去选更小的那个（_t_gui_smoke 的「上限 480」用例就是卡这条）。
+    _tol = max(min(_d) * 1.05, ar * 0.01)
+    _near = [t for t in pool if abs(t[0] / t[1] - ar) <= _tol]
+    return max(_near, key=lambda t: t[0] * t[1])
 
 
 # ---------------------------------------------------------------- 入口
@@ -644,10 +703,27 @@ except NameError:
 
 src_w, src_h = src.width, src.height
 
-# mpv 给的 clip 有时不带 fps 属性（fps_num/den 都 0）。补帧靠 AssumeFPS 把帧率乘上去，
-# 属性缺失时那步会静默失效 → 补到 48fps 的流被 mpv 当 24fps 播（等于慢放）。
-# 用 mpv 注入的 container_fps 兜底补上。LIVE_ASSUME_FPS 可手工覆盖。
-if src.fps_num == 0 or src.fps_den == 0:
+# ★★ VFR 源（`LIVE_VFR=1`，由 GUI 的 `ProbeWorker._probe_vfr` 判定后传入）：
+#   **绝不能** AssumeFPS。
+#   这类源（rmvb / RV40 是典型）mpv 给的每帧时长是**真实的**（实测本片在
+#   `83000/1000000` 与 `42000/1000000` 之间跳 = 12fps 段 / 24fps 段交替），
+#   但容器头写的是一个假帧率（本片写 30fps，真实平均只有 18.71fps）。
+#   一旦 AssumeFPS(container_fps) 就会把逐帧时长**全拍平成 1/30**
+#   → 视频时间轴按假帧率匀速走 → 与音频持续漂移、且随时间累积
+#   （实测 400 帧：不拍平 = **17.0s**（真值）/ 拍平 = 13.0s）。
+#   ⚠ 全程 `avsync`≈0、`frame-drop-count`=0 —— mpv 拿自己那套错的时间轴
+#     跟自己比，**结构上看不见**。别拿它当判据。
+#   代价：src.fps 保持 0 → 下面 interp_multi() 返回 0 → **补帧自动跳过**（会打日志）；
+#         超分不受影响（不改帧数、也不丢时长属性，实测 17.0s ✓）。
+_VFR_SRC = str(_env("LIVE_VFR", "")).strip() not in ("", "0")
+
+# （非 VFR 时）mpv 给的 clip 有时不带 fps 属性（fps_num/den 都 0）。补帧靠 AssumeFPS
+# 把帧率乘上去，属性缺失时那步会静默失效 → 补到 48fps 的流被 mpv 当 24fps 播
+# （等于慢放）。用 mpv 注入的 container_fps 兜底补上。LIVE_ASSUME_FPS 可手工覆盖。
+if _VFR_SRC:
+    log("源是**可变帧率（VFR）** → 保留 mpv 给的原始逐帧时长（不做 AssumeFPS）；"
+        "补帧将不可用，超分不受影响")
+elif src.fps_num == 0 or src.fps_den == 0:
     cf = float(_env("LIVE_ASSUME_FPS", "0") or 0) or \
          float(globals().get("container_fps", 0) or 0)
     if cf > 0:
@@ -785,6 +861,65 @@ def _stage_upscale_a4k(clip, src_w: int, src_h: int):
 
 
 # ---------------------------------------------------------------- 两个处理阶段
+def _may_build_src_engine(w: int, h: int) -> bool:
+    """这个源尺寸**允许**现场编引擎吗？任一不满足 → False（退回档位老路）。
+
+    ★ 门禁存在的理由都是"编了会出事"，不是省钱：
+      · 4x 模型 —— 源×4 输出（2242x1080 → 8968x4320），必炸；
+      · 短边 >1080 —— 4K 级源按源尺寸编会产出 8K 帧，实测光超分就丢 98 帧/14s；
+      · 设了 LIVE_SR_MAX 且源尺寸超限 —— 那是用户显式表达"我要小档位"，
+        不能自作主张编个大的（跟"限定导入分辨率"的语义直接冲突）；
+      · Anime4KCPP 路线 —— 它压根不用 .engine。
+    """
+    if not SR_BUILD or IS_A4K:
+        return False
+    if SR_NATIVE_SCALE != 2:
+        return False
+    e = min(w, h)
+    if not (_SR_BUILD_MIN_EDGE <= e <= _SR_BUILD_MAX_EDGE):
+        return False
+    if SR_MAX > 0 and (max(w, h) if SR_MAX_EDGE == "long" else e) > SR_MAX:
+        return False
+    return True
+
+
+def _target_engine_size() -> tuple[int, int]:
+    """超分现编引擎的目标尺寸：**保持源比例**，且受 LIVE_SR_MAX 约束（只缩不放）。
+
+    ★★ 2026-10-02 修（用户报「导入分辨率上限强行改变了高宽比」）：
+       LIVE_SR_MAX 砍档位池后，比例特殊的源（21:9 / 4:3 / 2.35:1）在固定档位里
+       挑不到同比例档 → pick_ladder 落到 16:9 档 → stage_upscale 把源**非等比**
+       压成 16:9，高宽比被改。这跟「限定导入分辨率省算力」是两码事，不能拿比例换。
+       ⇒ 现编引擎的目标尺寸按**源比例**算、再等比缩到「那条边 ≤ SR_MAX」：
+         · 不设 SR_MAX        → 源尺寸（与原行为一致）；
+         · 设了且源超限       → 等比缩到 短边=SR_MAX（short）/ 长边=SR_MAX（long），
+           比例=源，**不变形**；
+         · 源本身就没超限      → 源尺寸（不放大，放大没意义）。
+       这样「限定导入分辨率」照样省算力，但 21:9 永远输出 21:9。
+    """
+    if SR_MAX <= 0:
+        return src_w, src_h
+    edge = (max(src_w, src_h) if SR_MAX_EDGE == "long"
+            else min(src_w, src_h))
+    if edge <= SR_MAX:
+        return src_w, src_h
+    scale = SR_MAX / edge
+    return int(round(src_w * scale)), int(round(src_h * scale))
+
+
+def _ensure_src_engine(w: int, h: int) -> bool:
+    """给源尺寸准备引擎（命中缓存或现编）。成功 → True。
+
+    ★ 编译失败**不抛异常** —— 和 stage_upscale 的降级哲学一致：编不出来就当没
+      这回事，pick_ladder 继续用旧档位表，画面不会因此断掉。
+    """
+    if str(HERE) not in sys.path:                     # 见 sr_engine.py
+        sys.path.insert(0, str(HERE))
+    import sr_engine
+    eng = sr_engine.ensure(SR_MODEL, w, h, build=True, log=log)
+    return eng is not None
+
+
 def stage_upscale(clip):
     """RGBS 进 → 超分（选档 → TRT 引擎 → 尺寸对齐到 源×原生倍率）→ RGBS 出。
 
@@ -799,6 +934,21 @@ def stage_upscale(clip):
         if not A4K_OK:
             return clip, False
         return _stage_upscale_a4k(clip, src_w, src_h)
+
+    # ★★ 2026-10-02 按「源比例、受 SR_MAX 约束」的目标尺寸现编引擎（LIVE_SR_BUILD）：
+    #   档位表最大只到 1920x1080，所以 2242x1080 这类"比所有档位都宽"的源只能被
+    #   压进 1920x1080（横向 -14.4%）—— 更严重的是：设了 LIVE_SR_MAX 后，比例特殊的源
+    #   （21:9 / 4:3）在固定档位里挑不到同比例档，会被**非等比压成 16:9**，高宽比被改
+    #   （用户 2026-10-02 报的 bug）。
+    #   这里先算一个**比例=源**的目标尺寸 `_target_engine_size()`（受 SR_MAX 约束、只缩不放），
+    #   给它补引擎、补成功后**重扫 LADDER** —— pick_ladder 就会命中这个新档位
+    #   （比例 = 源比例），于是 resize 是**等比**的，全程零形变。
+    #   ⚠ 编不出来（门禁不通过 / 编译失败）就**完全维持原行为**，一行都不变。
+    global LADDER
+    _tw, _th = _target_engine_size()
+    if (_tw, _th) not in LADDER and _may_build_src_engine(_tw, _th):
+        if _ensure_src_engine(_tw, _th):
+            LADDER = _scan_ladder()
 
     lw, lh = pick_ladder(src_w, src_h)
     tmpl, edir = LADDER[(lw, lh)]
@@ -848,11 +998,23 @@ def stage_upscale(clip):
     #   ⚠ 需要这一步是因为**档位尺寸**未必等于源尺寸（pick_ladder 可能选了个
     #     不小于源的档位，如 1000x600 源 → 1280x720 档），推理输出是
     #     档位×2，而"该有的输出"是 源×2。两者不等时缩一次对齐。
+    #   ★★ 2026-10-02 修 bug（用户报「4K 源限定导入 720p 仍卡」）：
+    #     「两者不等时缩一次」这个说法**只对「档位 > 源」成立**。当**档位 < 源**
+    #     （4K 源 + SR_MAX=720 降到 1280x720 档）时，`ow,oh`（源×2 = 7680x4320）
+    #     反而比实际输出（档位×2 = 2560x1440）**大 3 倍** → 这一步退化成
+    #     **放大**，紧接着 fit_play_cap 又把它缩回来 —— 白跑一趟 8K。
+    #     实测代价：7680x4320 的 yuv420p16 ≈ 99.5 MB/帧，每帧两次 resize
+    #     ≈ 400 MB 内存流量，@23.976fps ≈ 9.6 GB/s → 滤镜链追不上，
+    #     mpv 直接报 `Audio/Video desynchronisation`。
+    #     ⇒ 对齐**只缩不放**：输出比目标大才缩；比目标小 = 用户显式降过档，
+    #       保持原样。（档位≈源尺寸的 720p/1080p 源行为完全不变。）
     ow, oh = int(round(src_w * SR_NATIVE_SCALE)), int(round(src_h * SR_NATIVE_SCALE))
-    if (hr.width, hr.height) != (ow, oh):
+    if hr.width > ow or hr.height > oh:
         hr = core.resize.Bicubic(hr, ow, oh, filter_param_a=1 / 3,
                                  filter_param_b=1 / 3)
-    log(f"  {time.perf_counter() - t0:.2f}s 完成图构建 → 输出 {ow}x{oh}")
+    # ★ 这里必须报**实际**尺寸（不是 ow/oh）—— 降档时二者不等，
+    #   写 ow/oh 会打成 7680x4320，正是这次 bug 骗过所有人的原因。
+    log(f"  {time.perf_counter() - t0:.2f}s 完成图构建 → 输出 {hr.width}x{hr.height}")
     return hr, True
 
 
@@ -1290,104 +1452,7 @@ if ORDER == "auto":
         _CPU_VFI_FORCED_HR = True
     else:
         _CPU_VFI_FORCED_HR = False
-    # ★★ 4x 模型 + 补帧 = **跑不动**（2026-09-30 实测，与顺序无关）：
-    # ★ LR 下超分输入是**补过帧的**（帧数翻倍），所以引擎最好是原生 2x：
-    #   4x 模型（animevideov3）在 LR 下那个 5120x2880 的中间步骤要做**两倍次数**，
-    #   实测反而比 HR 更慢（37.91 vs 29.91 ms/输出帧）。
-    #   ⚠ 「4x + 补帧 = 跑不动」的**无条件降级**见下面 `_SR_FORCE` 那段
-    #     （放在 auto 分支外面 —— 显式 LIVE_ORDER 时也要生效）。
-    # ⚠ 这里**不再处理**「4x 模型」的降级 —— 统一交给下面 auto 分支之外的
-    #   `_SR_FORCE` 块。原先这里有两条 LR 专属的 if/elif，会和那个块**重复触发**：
-    #   先打印"是你显式指定的，就按你说的来"，紧接着又被无条件块降级 ——
-    #   两条自相矛盾的警告（2026-09-30 实测日志里抓到的）。
 
-# ★★ 2026-09-30：4x 模型 + 补帧 = **跑不动**（实测，与顺序无关）：
-#     720p 源 + animev3(4x) + 补帧 48：  LR 丢 159~392 帧 / HR 丢 107 帧
-#     同条件换 2x（re2x）：              LR / HR **都丢 0**
-#   这是"能不能看"（会不会卡顿/音画不同步）的问题，不是画质偏好，
-#   所以**不再看 `_SR_USER_FORCED`** —— 那个判据让 GUI 场景永久失效
-#   （GUI 恒传 LIVE_SR → 永远被视为"用户强制"，自动优化一次都没跑过）。
-#   ⚠ 这段**必须放在 `if ORDER == "auto":` 之外**：第一版写在了里面，
-#     结果显式 `LIVE_ORDER=hr/lr` 时整段被跳过、修复"没生效"（测试抓到的）。
-#   ⚠ 留逃生口 `LIVE_SR_FORCE=1`（真要 4x 就设它，后果自负）；
-#   ⚠ 只对**大源**（宽 ≥1280）强制 —— 小源推理档位小，4x 未必跑不动。
-_SR_FORCE = _flag("LIVE_SR_FORCE", False)
-# 触发条件（2026-09-30 深夜**放宽**）：不再要求补帧也开着 ——
-#   **只要超分开着、模型是 4x、源宽 ≥1280 就降级。**
-#   实测（1920x1080 CFR 源 + 真窗口 + 真音频时钟，`_t_single_modes.py`）：
-#     完全不加滤镜        → 丢 0 帧，avsync 0            ✓
-#     单独超分 animev3(4x) → 输出 **7680x4320** → 稳定期丢 98 帧、avsync 涨到 +7.9s ❌
-#     单独超分 re2x(2x)    → 输出 3840x2160     → 丢 0 帧  ✓
-#     单独补帧 rife×2      → 输出 1920x1080@48  → 丢 0 帧  ✓
-#   机理：4x 推理**本身**就要吐 7680x4320 的帧，光这一步就供不上 23.976fps，
-#        跟补帧开不开无关（补帧只是再翻一倍）。而 1080p 源 ×4 = 7680x4320
-#        是 4K 的两倍、超出任何显示器 —— 纯白烧，降级没有画质损失。
-#   ⚠ 小源（宽 <1280）保留 4x：例如 960x540 ×4 = 3840x2160 正好 4K，是有意义的用法。
-#   ⚠ 补帧 + LR 仍要降级（4x 要把中间步骤做两倍次数）。
-if (UPSCALE_ON and SR_NATIVE_SCALE == 4
-        and (src_w >= 1280 or (INTERP_ON and ORDER == "lr"))):
-    if _SR_FORCE:
-        warn(f"LIVE_SR_FORCE=1：保留 4x 模型（{SR_MODEL}）—— "
-             f"实测会丢帧（1080p 输出 7680x4320 丢 98 帧/14s、avsync 涨到 +7.9s；"
-             f"720p 配补帧丢 100~400 帧），卡顿/音画不同步别怪链路。")
-    else:
-        warn(f"4x 模型（{SR_MODEL}）在 {src_w}x{src_h} 源上跑不动："
-             f"单独超分实测（1080p）输出 7680x4320、丢 98 帧/14s、avsync 涨到 "
-             f"+7.9s；配补帧更要丢 100~400 帧。换 2x 则丢 0 帧。"
-             f"→ 自动改用 2x 的 realesr-animevideov3_re2x。"
-             f"想要 4x 请设 LIVE_SR_FORCE=1 强制保留（小源不受影响）。")
-        SR_MODEL = "realesr-animevideov3_re2x"
-        SR_CANDIDATES = _sr_ladder_dirs()
-        LADDER = _scan_ladder()
-        SR_NATIVE_SCALE = 2
-
-# ★★★ 2026-09-30 深夜：**超分+补帧的自动让路**（全部数据来自用户的真片源实测）
-#   受测素材：用户自己的 1920x1080 H.264 23.976 + 音轨，走他的 ui_config.json、
-#   真 GUI、窗口最大化（osd 2560x1440@143.999Hz），**拖进度条**（20 条异步 seek）后测：
-#     LR + 不限  → 视频只跑到 0.73 倍实时，落后 +2.6~3.0 秒（丢 300+ 帧）❌
-#     LR + 限1080 → 仍丢 85 帧、+0.53 秒                              ❌
-#     HR + 限1080 → **0 丢帧 / -0.04 秒**                              ✓
-#     HR + 限1440 → **0 丢帧 / -0.04 秒**                              ✓
-#   机理：真正贵的是**补帧要处理的尺寸** ——
-#     LR：补帧在源尺寸（便宜），但超分要对**每个输出帧**做一遍（帧数翻倍 → 双倍）
-#     HR：超分只做源帧数，但补帧要在超分后的大图上做（2160p 的 RIFE 极贵）
-#   把「限定播放分辨率」压到源尺寸后，两条都回到各自单独跑得动的量级。
-#   判据仍是像素吞吐（ow*oh*fps_out > 「4K@24」×1.3）；**只对宽 ≥1280 的源**生效
-#   ⚠ 闸门用 **短边 ≥1000**（"1080p 级以上的源"）而不是"宽 ≥1280" ——
-#     后者对 720p（正好宽 1280）也成立，而 720p 同开实测毫无压力，会被误伤。
-#   ⚠ `LIVE_THROUGHPUT_FORCE=1` 可保留用户原样（后果自负）。
-_THROUGHPUT_FORCE = _flag("LIVE_THROUGHPUT_FORCE", False)
-if UPSCALE_ON and INTERP_ON and min(src_w, src_h) >= 1000:
-    try:
-        _ow, _oh = _native_out_size()
-        _mfps = src.fps * interp_multi(src) if src.fps else 0
-        _budget = 3840 * 2160 * 24.0          # 一个 4K@24 流 = 实测能供上的量
-        _load = _ow * _oh * float(_mfps or 0)
-        if _mfps and _load > _budget * 1.3:
-            _cap0 = min(src_w, src_h)
-            if _THROUGHPUT_FORCE:
-                warn(f"超分+补帧同开：输出 {_ow}x{_oh} @ {_mfps:g}fps，像素吞吐是"
-                     f"「4K@24」的 {_load / _budget:.1f} 倍。LIVE_THROUGHPUT_FORCE=1："
-                     f"保留原样 —— 实测会丢 300+ 帧、拖进度条后音画错开 2.6~3.0 秒。")
-            elif PLAY_MAX_H <= 0:
-                warn(f"超分+补帧同开：输出 {_ow}x{_oh} @ {_mfps:g}fps，像素吞吐是"
-                     f"「4K@24」的 {_load / _budget:.1f} 倍 —— 实测供不上"
-                     f"（视频只跑到 0.73 倍实时，拖一次进度条就落后 2.6~3.0 秒）。"
-                     f"→ 自动改成 **HR 顺序 + 限定播放分辨率 {_cap0}**"
-                     f"（源尺寸）：同样配置实测 **0 丢帧 / 音画差 -0.04 秒**。"
-                     f"想要更大的输出，请把「限定播放分辨率」自己设成 1440 以上"
-                     f"（实测 1440 也扛得住），或超分/补帧只留一个；"
-                     f"LIVE_THROUGHPUT_FORCE=1 可强制保留原样。")
-                ORDER = "hr"
-                PLAY_MAX_H = _cap0
-                PLAY_MAX_EDGE = "short"
-            else:
-                warn(f"超分+补帧同开：输出 {_ow}x{_oh} @ {_mfps:g}fps，像素吞吐是"
-                     f"「4K@24」的 {_load / _budget:.1f} 倍 —— 实测供不上。"
-                     f"你已显式设了「限定播放分辨率 {PLAY_MAX_H}」，不替你改；"
-                     f"若仍卡/错位，把它降到 {_cap0} 试试（实测 0 丢帧）。")
-    except Exception as _le:                                # noqa: BLE001
-        log(f"  （像素吞吐预算检查跳过：{type(_le).__name__}: {str(_le)[:60]}）")
 
 log(f"顺序 {ORDER.upper()}（{'先补帧后超分' if ORDER == 'lr' else '先超分后补帧'}）"
     f"  超分模型 {SR_MODEL}")
@@ -1490,6 +1555,45 @@ log(f"链路就绪：超分={'开' if UPSCALE_ON else '关'} "
     f"补帧={'开' if INTERP_ON else '关'} 顺序={ORDER.upper()} → "
     f"{shown.width}x{shown.height} @ {shown.fps!s}")
 
+# ═══════════════════════════════════════════════════════════════════════
+# ⚠ 已知坑 · 定案（2026-10-01）：VFR 源（rmvb 这类「容器帧率 ≠ 真实帧率」的
+#   假 CFR）一挂上本滤镜链就**音画持续漂移**。
+#
+# 取证对象：D.Gray-man 01 HDTVRIP rv40 848x480。容器头写 30fps，但 ffmpeg
+#          showinfo 的逐帧 pts 间隔在 42ms / 83ms 之间交替（12fps 段 / 24fps 段）；
+#          整片 25997 帧 ÷ 1389.76s = **真实平均 18.71fps**。
+#
+# ★ 真凶 = **本文件上面那句 `AssumeFPS(container_fps)`**（不是超分、不是补帧）：
+#   探针实测 mpv 注入的输入帧带的是**真实逐帧时长**
+#     （`_DurationNum/_DurationDen` = 83000/1000000、42000/1000000 … 逐帧在跳），
+#   但容器帧率是假的 30 → AssumeFPS 把时长**全拍平成 1/30**
+#     （自带探针 `LIVE_PROBE_DUR=1` 读回：`_DurationNum=1 _DurationDen=30`）
+#   → 时间轴按假帧率匀速走 → 与音频持续漂移、且随时间累积。
+#   决定性对照（`--frames=400 --untimed`）：
+#     不 AssumeFPS = **17.0s**（真值） ／ AssumeFPS(30) = **13.0s**（= 400/30）
+#   ⇒ 这也解释了「只超分 / 只补帧 / 全开都偏」——它在链首，跟开关无关。
+#
+# ⚠ 两个曾经走错的方向，别再走：
+#   ① 「TRT 超分 / 补帧把 `_Duration*` 弄丢了，mpv 只好退回 container_fps」
+#      —— **错**。实测「跳过 AssumeFPS + TRT 超分」= 17.0s 完全正确；
+#      看到的"恒 1/30"就是 AssumeFPS 干的，不是 TRT 丢的。
+#      （补帧确实要用 AssumeFPS/BlockFPS 改帧率，但那是它正常该做的事。）
+#   ② 「用 `--container-fps-override` 覆盖成实测平均帧率」—— **也不行**：
+#      · 仍然是在拍平，只是把输入从「假的 30」换成「采样出的另一个数」；
+#      · 这类源片内帧率本身就在漂（实测 0s→22.80、600s→14.73、1350s→21.20），
+#        **没有单一帧率能覆盖全片**（按采样值 22.8 算，总长 1140s ≠ 音频 1389.76s）；
+#      · 它还会反过来改掉 mpv 注入的 `_DurationNum`（设成 23.5 后输入帧时长
+#        跟着变成 2/47），把真值一并弄脏。
+#
+# ⇒ 正解：**VFR 源不做 AssumeFPS**（`LIVE_VFR=1`，由 GUI 判定后传入，见上面的分支）。
+#   为什么判别不放这儿：VS **构建期读帧只会拿到 mpv 的黑桩帧**
+#   （`[vapoursynth] Frame requested during init! ... Returning black dummy
+#    frame with 0 duration.`），拿不到任何真值 → 只能由 GUI 侧先解一段来判。
+#   代价：补帧需要恒定帧率 → VFR 源**自动跳过补帧**；超分不受影响。
+#
+#   ⚠ 全程 `avsync` ≈ 0、`frame-drop-count` = 0 —— mpv 自己看不见这个问题
+#     （它拿自己那套错的时间轴跟自己比）。只有烧 pts / 数帧数 / 逐帧 duration 能看见。
+
 # ⚠ 输出必须用 **VideoNode.set_output()** 注册 —— 这是 VS API4 的机制。
 #   实测确认（R77 + mpv 0.41）：只写 `output = shown`（那套老约定）时，
 #   mpv 的 getOutputNode(script, 0) 会返回 NULL，报
@@ -1500,5 +1604,25 @@ log(f"链路就绪：超分={'开' if UPSCALE_ON else '关'} "
 #   包一层 `std.ModifyFrame` 让 python 回调计时 —— mpv 走的是 TRT 的 GPU 路径，
 #   根本不触发 CPU 回调，一行日志都不会打。要量单帧耗时请用独立的
 #   `_t_noise_cost.py`（VS 侧直接 get_frame 循环 + 逐帧噪声输入防缓存）。
+# ═══ 临时探针（LIVE_PROBE_OUT_DUR=1）：验证超分/补帧后 duration 属性是否还在
+if str(_env("LIVE_PROBE_OUT_DUR", "")).strip() not in ("", "0"):
+    # 落在脚本同目录（别硬编码盘符 —— 这个文件夹是要拷到别的机器跑的）
+    import os as _os
+    try:
+        _pd = _os.path.dirname(_os.path.abspath(__file__))    # noqa: F821
+    except NameError:
+        _pd = "."
+    _of = open(_os.path.join(_pd, "_probe_out.txt"), "w", buffering=1)
+
+    def _odur(n, f):
+        _p = f.props
+        _of.write("out n=%d dur=%s/%s fmt=%s\n"
+                  % (n, _p.get("_DurationNum"), _p.get("_DurationDen"),
+                     f.format.name))
+        return f
+
+    log(f"探针已挂：输出 clip fps={shown.fps!s}")
+    shown = core.std.ModifyFrame(shown, shown, _odur)
+
 shown.set_output(0)
 output = shown

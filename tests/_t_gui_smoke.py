@@ -289,7 +289,9 @@ ck(G.resolve_target_fps(60, 24.0) == 60.0, "指定 60 就照给 60（不自动�
 ck(G.resolve_target_fps(0, 0.0) == 48.0, "源帧率未知 → 兜底 24fps×2",
    G.resolve_target_fps(0, 0.0))
 ck(G.resolve_multi(None, 24.0) == 2.0, "sel=None（组合框未就绪）→ 当 auto")
-ck(len(w.engines) >= 12, "扫到超分引擎", f"{len(w.engines)} 个")
+# ⚠ 阈值不能写死大数：档位数会随 LIVE_SR_BUILD 现编（按源尺寸落盘）与引擎重编而
+#   增减 —— 原来写 `>= 12` 在 models/sr 只有 7 个档时必然误报。这里只验"扫盘没坏"。
+ck(len(w.engines) >= 4, "扫到超分引擎", f"{len(w.engines)} 个")
 
 # ═════════════════════════════════════════════════ 5 日志覆盖语义
 print("== 5 日志面板覆盖语义 ==")
@@ -402,7 +404,7 @@ print(f"  预估卡文字：{w.lb_plan.text()[:120].replace(chr(10), ' | ')}")
 print("== 9 配置记忆往返 ==")
 w.cb_multi.setCurrentIndex(w.cb_multi.findData(-3))
 w.chk_mpvlog.setChecked(True)
-_i_rv = w.cb_rifev.findData("4.9")
+_i_rv = w.cb_rifev.findData("4.25_lite")
 if _i_rv >= 0:
     w.cb_rifev.setCurrentIndex(_i_rv)
 _i_sm = w.cb_srmax.findData(1080)
@@ -428,7 +430,9 @@ d = {
     "estimated-vf-fps": 43.2, "estimated-frame-rate": 47.95,
     "frame-drop-count": 0, "mistimed-frame-count": 0,
     "decoder-frame-drop-count": 0, "vo-delayed-frame-count": 0,
-    "video-params/w": 2560, "video-params/h": 1440,
+    "video-params/w": 1280, "video-params/h": 720,            # 解码器输出（源）
+    "video-out-params/w": 2560, "video-out-params/h": 1440,   # 滤镜之后（超分后）
+    "display-fps": 143.999,
     "pause": False,
 }
 h1 = G.MainWindow.render_live(d, 43.8, 48.0, 0.0)
@@ -436,7 +440,15 @@ ck("输出 <b>43.8 fps" in h1, "输出帧率进面板")
 ck("实际显示 <b>43.8 fps" in h1, "零丢帧时实际显示 = 输出")
 ck("01:23" in h1 and "24:05" in h1, "进度格式化 mm:ss")
 ck("2/3" in h1, "播放列表位置")
-ck("2560×1440" in h1, "输出分辨率")
+# ★ 分辨率必须用 video-out-params（滤镜链之后 = 超分后的真实输出）。
+#   用 video-params 会一直显示**源**尺寸：实测挂超分播 1280x720 源时，
+#   面板显示"→ 1280×720"，而真输出是 2560×1440。
+ck("2560×1440" in h1, "分辨率取 video-out-params（超分后的输出）")
+ck("1280×720" not in h1, "不显示源分辨率（video-params）")
+ck("屏 144Hz" in h1, "显示显示器刷新率")
+ck("实时" not in h1, "没传实测帧率 → 不出现「实时」（排版与旧版一致）")
+ck("实时 <b>41.2 fps" in G.MainWindow.render_live(d, 43.8, 48.0, 0.0, 41.2),
+   "传了实测帧率 → 显示「实时」")
 ck("● 流畅" in h1 and "7fd6a0" in h1, "零丢帧 → 绿色「流畅」")
 ck("达成 91%" in h1, "达成率按实际显示算")
 h2 = G.MainWindow.render_live(dict(d, **{"frame-drop-count": 218}), 48.0, 48.0, 20.0)
@@ -475,6 +487,20 @@ ck(abs(w._drop_rate(5.0) - 20.0) < 0.5, "丢帧速率 = 20/s",
 w._drop_hist = [(now, 5)]
 ck(w._drop_rate(5.0) == 0.0, "样本不足 → 速率 0（不抛异常）")
 w._drop_hist = []
+# ★ 实测帧率（帧号差分）—— 全项目**唯一真·实测**的帧率来源：
+#   estimated-vf-fps 是滤镜链声明值（恒定），帧号差分才是真跑出来的速率。
+w._fno_hist = []
+w._sample({"estimated-frame-number": 100})
+w._sample({"estimated-frame-number": True})        # 布尔 → 丢
+w._sample({"estimated-frame-number": "100"})       # 字符串 → 丢
+w._sample({"media-title": "只有标题"})              # 无关字段 → 不采
+ck(len(w._fno_hist) == 1, "只收整数帧号", str(len(w._fno_hist)))
+w._fno_hist = [(now - 2.0, 100), (now, 148)]
+ck(abs(w._real_fps(5.0) - 24.0) < 0.5, "实测帧率 = Δ帧号 / Δt = 24/s",
+   f"{w._real_fps(5.0):.2f}")
+w._fno_hist = [(now, 5)]
+ck(w._real_fps(5.0) is None, "样本不足 → None（不抛异常）")
+w._fno_hist = []
 
 st = G.MpvStat(r"\\.\pipe\nonexistent")
 ck(st.snapshot == {} and st.opened is False, "IPC 快照初始为空、未连接")
@@ -841,6 +867,113 @@ if _early_defs:
        "非法参数走『常量区记录 → warn 定义后统一报』的延迟报警模式")
 else:
     ck(False, "live.vpy 里找不到 log/warn 定义（结构变了？）")
+
+print()
+print("== 15 VFR 源（rmvb 这类「容器帧率造假」的）判定与传参 ==")
+# 背景：这类源的容器帧率是假的（D.Gray-man：写 30fps，真实平均 18.71fps），
+# live.vpy 开头的 AssumeFPS(container_fps) 会把逐帧时长**拍平** → 时间轴按假帧率
+# 走 → 与音频持续漂移（实测 400 帧：不拍平 17.0s / 拍平 13.0s）。
+# 修法：GUI 判到 VFR 就置 LIVE_VFR=1，让 live.vpy 跳过 AssumeFPS。详见 build_launch。
+_cfg_v = w._collect_cfg()
+_env_v, _arg_v = G.build_launch(_cfg_v, ["X:/a.rmvb"], r"\\.\pipe\t", vfr=True)
+ck(_env_v.get("LIVE_VFR") == "1", "vfr=True → env LIVE_VFR=1", _env_v.get("LIVE_VFR"))
+ck(not any("container-fps-override" in a for a in _arg_v),
+   "vfr=True 但没给实测帧率 → 不覆盖容器帧率")
+_arg_r = G.build_launch(_cfg_v, ["X:/a.rmvb"], r"\\.\pipe\t",
+                        vfr=True, real_fps=22.8)[1]
+ck(any("--container-fps-override=22.8" in a for a in _arg_r),
+   "vfr=True + real_fps → 覆盖容器帧率（只修统计页显示，不碰时间轴）",
+   str([a for a in _arg_r if "override" in a]))
+ck(not any("container-fps-override" in a for a in
+           G.build_launch(_cfg_v, ["X:/a.mkv"], r"\\.\pipe\t")[1]),
+   "默认（不传 vfr）也不传 --container-fps-override")
+_env_c, _ = G.build_launch(_cfg_v, ["X:/a.mkv"], r"\\.\pipe\t", vfr=False)
+ck(_env_c.get("LIVE_VFR") == "0", "vfr=False → env LIVE_VFR=0，正常 CFR 行为不变",
+   _env_c.get("LIVE_VFR"))
+ck("LIVE_VFR" in _LV, "live.vpy 里读 LIVE_VFR")
+# ⚠ 不能拿 `_LV.split("AssumeFPS")` 判 —— 文件头的 env 说明里也写着 "跳过 AssumeFPS"。
+#   要按**实际调用** `src.std.AssumeFPS(` 的位置比。
+_pos_branch = _LV.find("_VFR_SRC = str(")
+_pos_assume = _LV.find("src.std.AssumeFPS(")
+ck(-1 < _pos_branch < _pos_assume,
+   "live.vpy 的 _VFR_SRC 分支排在 src.std.AssumeFPS() 调用之前（否则等于没修）",
+   f"_VFR_SRC@{_pos_branch} / AssumeFPS@{_pos_assume}")
+ck("elif src.fps_num == 0 or src.fps_den == 0:" in _LV,
+   "AssumeFPS 兜底仍保留（给正常 CFR 源用）")
+ck(hasattr(G.ProbeWorker, "_probe_vfr") and not hasattr(G.ProbeWorker, "_probe_real_fps"),
+   "ProbeWorker 用 _probe_vfr（判 VFR），旧的 _probe_real_fps 已撤")
+# ═════════════════════════════════════════════════ 16 按源尺寸现编引擎（LIVE_SR_BUILD）
+print("== 16 按源尺寸现编引擎（LIVE_SR_BUILD）==")
+_LG = (ROOT / "live_gui.py").read_text(encoding="utf-8")
+ck('SR_BUILD = _flag("LIVE_SR_BUILD", True)' in _LV, "LIVE_SR_BUILD 默认开")
+ck("def _may_build_src_engine(" in _LV and "def _ensure_src_engine(" in _LV,
+   "现编的门禁与入口都已定义")
+_bld = _LV.split("def _may_build_src_engine(")[1].split("def _ensure_src_engine(")[0]
+ck("SR_NATIVE_SCALE != 2" in _bld, "4x 模型不现编（源×4 输出太大）")
+ck("_SR_BUILD_MIN_EDGE <= e <= _SR_BUILD_MAX_EDGE" in _bld,
+   "有短边上下限（防 4K 级源编出 8K）")
+ck("SR_MAX > 0 and" in _bld, "设了 LIVE_SR_MAX 且源超限 → 不现编（尊重限档意图）")
+ck("IS_A4K" in _bld, "Anime4KCPP 路线不走引擎现编")
+# ★ 现编的档位会进 LADDER，兜底若按"面积最大"挑就会被它抢走（2242x1080 面积 >
+#   1920x1080，而两者比例不同 → 4K 源被横向拉伸）：必须"比例接近里取面积最大"。
+#   两处实现必须一致，否则 GUI 预估卡和真跑出来的档位不一样。
+ck("_near = [t for t in pool if abs(t[0] / t[1] - ar) <= _tol]" in _LV,
+   "vpy 侧选档兜底：比例接近的档里取面积最大")
+ck("_near = [t for t in lad if abs(t[0] / t[1] - ar) <= _tol]" in _LG,
+   "GUI 侧选档兜底与 vpy 一致")
+ck("max(pool, key=lambda t: t[0] * t[1])" not in _LV.split("def pick_ladder(")[1][:3000],
+   "vpy 侧「按面积挑最大档」的旧兜底已撤")
+ck((ROOT / "sr_engine.py").is_file(), "sr_engine.py 存在（现编实现）")
+# 行为面：4K 源（16:9）不能被"面积更大但比例不同"的档位抢走
+ck(G.pick_ladder(3840, 2160, "realesr-animevideov3_re2x", 0) == (1920, 1080),
+   "4K 源选 1920x1080（不被非同比例的现存档位抢走）")
+# 统计面板的属性选择（用错会显示源尺寸/恒定帧率，2026-10-02 修）
+ck('9: "video-out-params/w"' in _LG, "统计面板取滤镜链之后的尺寸（不是源尺寸）")
+ck("def _real_fps(" in _LG and "estimated-frame-number" in _LG,
+   "有实测帧率（帧号差分）—— mpv 没有 estimated-display-fps 这个属性可用")
+
+# ═════════════════════════════════════════════════ 17 把统计推到 mpv 画面（OSD）
+print("== 17 OSD 统计（全屏时也能看到）==")
+_args_osd_on = G.build_launch(dict(G.DEFAULTS, osd_stat=True),
+                              ["a.mkv"], r"\\.\pipe\x")[1]
+_args_osd_off = G.build_launch(dict(G.DEFAULTS, osd_stat=False),
+                               ["a.mkv"], r"\\.\pipe\x")[1]
+ck("--osd-level=3" in _args_osd_on,
+   "开了「画面上显示统计」→ 加 --osd-level=3（否则 level 3 的 OSD 不显示）")
+ck("--osd-level=3" not in _args_osd_off, "关掉 → 不加该参数")
+ck(hasattr(G.MpvStat, "push"),
+   "MpvStat 有 push()（读线程独占管道，写必须来自另一个线程）")
+# OSD 文本必须是**纯文本**（OSD 不认 HTML），且含关键指标
+_ol = w._osd_line({"video-out-params/w": 2560, "video-out-params/h": 1440,
+                   "display-fps": 144.0, "frame-drop-count": 137},
+                  23.9, 12.0, 23.4)
+ck("<" not in _ol and ">" not in _ol, "OSD 行是纯文本（不带 HTML 标签）", _ol)
+ck("实时 23.4 fps" in _ol and "2560×1440" in _ol and "屏 144Hz" in _ol,
+   "OSD 行含实测帧率 / 输出分辨率 / 刷新率")
+ck("丢帧 12.0/s" in _ol and "累计 137" in _ol, "有丢帧时 OSD 带速率与累计")
+_ol2 = w._osd_line({"video-out-params/w": 2560, "video-out-params/h": 1440},
+                   23.9, 0.0, None)
+ck("丢帧" not in _ol2 and "实时" not in _ol2,
+   "没丢帧/没实测帧率时不硬塞这两段")
+# ★ 第二行：GPU 利用率/显存 + CPU 利用率 + 硬件型号（SysStat 后台采集；
+#   采集线程不在时整行不出现，不能硬塞空行）
+class _FakeSys:
+    snapshot = {"gpu_util": 21, "gpu_mem_used": 1005, "gpu_mem_total": 16376,
+                "cpu_util": 12}
+w._sys = _FakeSys()
+_ol3 = w._osd_line({"video-out-params/w": 2560, "video-out-params/h": 1440,
+                    "display-fps": 144.0}, 23.9, 0.0, 23.4)
+ck("GPU 21%" in _ol3 and "1.0/16.0G" in _ol3 and "CPU 12%" in _ol3,
+   "OSD 第二行含 GPU 利用率/显存/CPU 利用率", _ol3)
+ck("RTX 4080" in _ol3 and "i7-12700KF" in _ol3,
+   "OSD 第二行含硬件短名（NVIDIA/GeForce 前缀已剥）")
+ck("\n" in _ol3, "GPU/CPU 在第二行（show-text 的 \\n 会渲染成换行）")
+w._sys = None
+_ol4 = w._osd_line({"video-out-params/w": 2560, "video-out-params/h": 1440},
+                   23.9, 0.0, 23.4)
+ck("\n" not in _ol4, "采集线程不在 → 不出第二行（不硬塞）")
+ck(hasattr(G, "SysStat") and hasattr(G.SysStat, "run"),
+   "SysStat 采集线程存在（GPU 用 nvidia-smi 子进程、CPU 用 psutil）")
 
 if G.CFG_PATH.exists():
     G.CFG_PATH.unlink()

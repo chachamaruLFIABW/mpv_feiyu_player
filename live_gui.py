@@ -34,19 +34,23 @@ import time
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QFont, QTextCursor
+from PySide6.QtCore import QProcess, QProcessEnvironment, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
-    QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QGroupBox,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow,
-    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
-    QSpinBox, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
+    QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
 )
 
 # ═══════════════════════════════════════════════════════════════ 路径与常量
 
-ROOT = Path(__file__).resolve().parent
+if getattr(sys, "frozen", False):
+    # 打包成 exe 后，资源（mpv/、live.vpy、models/、mpv_cn/ …）放在 exe 同级目录
+    ROOT = Path(sys.executable).resolve().parent
+else:
+    ROOT = Path(__file__).resolve().parent
 MPV = ROOT / "mpv" / "mpv.exe"
 SCRIPT = ROOT / "live.vpy"
 # 中文界面资源目录 —— 当作 mpv 的配置目录用（--config-dir 指过去），里面有：
@@ -225,14 +229,15 @@ def sr_available() -> list[tuple[str, str, int, list[tuple[int, int]]]]:
 #   实测全灭（4.26 / 4.25_lite 都报 ElementwiseOperation PROD must have same input types）。
 #   `ms` = **实机 720p 源、2x、fp16 IO、2 流** 的 ms/输出帧（2026-09-30 实测）。
 #   tile 倍率不同（4.25_lite 要 128，其余 64/32），代码里按版本自动取。
+#
+# ★ 2026-10-01 清理：以前这里列了 4.0/4.4/4.6/4.9/4.10 五条，但
+#   models/rife/ 里**只有 4.26 和 4.25_lite 两个 .onnx**，那五条靠
+#   `cb_rifev` 的 is_file() 过滤永远显示不出来 —— 属于死条目（只会让
+#   维护者以为本机还有别的版本）。要加版本请两步一起做：把 .onnx 放进
+#   models/rife/，再在这里补一行。
 RIFE_MODELS: list[tuple[str, str, float]] = [
-    ("4.26", "RIFE 4.26（默认，完整网络）",              9.14),
+    ("4.26", "RIFE 4.26（完整网络，默认）",              9.14),
     ("4.25_lite", "RIFE 4.25 lite（轻量，省显存）",         7.77),
-    ("4.9",  "RIFE 4.9（旧版，快）",                     7.98),
-    ("4.4",  "RIFE 4.4（旧版，快）",                     8.01),
-    ("4.6",  "RIFE 4.6（旧版）",                         8.36),
-    ("4.0",  "RIFE 4.0（最老，兼容性最好）",             9.13),
-    ("4.10", "RIFE 4.10（旧版，偏慢）",                 10.00),
 ]
 
 
@@ -302,6 +307,10 @@ DEFAULTS = {
     "mv_preset": "fast", "mv_opt": "4",
     "device": 0, "streams": 2, "matrix": "709", "verbose": True,
     "mpv_verbose": False, "concurrent": 6,
+    # mpv 程序路径：留空 = 用自带的 mpv/mpv.exe；填了且文件存在 = 用那个（GUI 里可换）。
+    "mpv_path": "",
+    # 把统计行推到 mpv 的 OSD（左上角小字）—— 全屏播放时不用切回界面看。
+    "osd_stat": True,
     "last_in_dir": "", "files": [],
 }
 
@@ -326,6 +335,153 @@ def save_cfg(d: dict) -> None:
         os.replace(tmp, CFG_PATH)
     except Exception:
         pass
+
+
+def resolve_mpv(mpv_path: str | None) -> Path:
+    """解析实际要用的 mpv 程序。
+
+    - 配置了且文件存在 → 用那个（GUI 里可换成任意 mpv 构建）。
+    - 否则回落到自带的 mpv/mpv.exe。
+    """
+    if mpv_path:
+        p = Path(mpv_path)
+        if p.is_file():
+            return p
+    return ROOT / "mpv" / "mpv.exe"
+
+
+# ════════════════════════════════════════════════════════════════════
+# 「关于」对话框内容（与 README「关于」段保持一致；链接均为实测的上游地址）
+ABOUT_HTML = """<p><b>作者</b>：bilibili <b>茶茶丸想大摆特摆</b></p>
+<p>完全免费、开源：供个人学习 / 使用永久免费，无付费墙、广告或后台上报；
+代码全部开源，可随意查看、修改、二次分发。</p>
+<p>本质是一条串联脚本：把 mpv、VapourSynth、vs-mlrt、RIFE、Anime4KCPP 等现成
+开源组件用 <code>live.vpy</code> 串起来，真正的超分 / 补帧能力都来自上方这些上游项目。</p>
+<p><b>协议</b>：本项目整体以 <b>GPL-3.0-or-later</b> 发布（依赖链含 GPL-2.0 与 GPL-3.0，
+均带 "or later"，向上兼容）。完整许可证见仓库根目录的 <code>LICENSE</code> 文件。</p>
+<table border="0" cellspacing="4" cellpadding="2">
+<tr><th align="left">组件</th><th align="left">角色</th><th align="left">协议</th></tr>
+<tr><td><a href="https://mpv.io/">mpv</a></td><td>播放器本体</td><td>GPL-2.0-or-later</td></tr>
+<tr><td><a href="https://www.vapoursynth.com/">VapourSynth</a></td><td>滤镜框架</td><td>LGPL-2.1-or-later</td></tr>
+<tr><td><a href="https://github.com/AmusementClub/vs-mlrt">vs-mlrt</a></td><td>TRT / ONNX / ncnn 推理后端</td><td>GPL-3.0-or-later</td></tr>
+<tr><td><a href="https://github.com/TianZerL/Anime4KCPP">Anime4KCPP</a></td><td>Anime4K 超分</td><td>GPL-3.0</td></tr>
+<tr><td><a href="https://github.com/the-database/mpv-upscale-2x_animejanai">AnimeJaNai</a></td><td>AnimeJaNai 超分脚本</td><td>GPL-3.0-or-later</td></tr>
+<tr><td><a href="https://github.com/hzwer/ECCV2022-RIFE">RIFE</a></td><td>补帧</td><td>Apache-2.0</td></tr>
+<tr><td><a href="https://github.com/xinntao/Real-ESRGAN">Real-ESRGAN</a></td><td>超分（代码 + 模型）</td><td>代码 Apache-2.0 / 模型 BSD-3-Clause</td></tr>
+</table>
+<p>⚠ <b>模型权重额外限制</b>：AnimeJaNai 系列模型（<code>.onnx</code>）为
+<b>CC-BY-NC-SA-4.0</b>（署名-非商业性-相同方式共享），<b>不得用于商业用途</b>；
+它们只是被本项目调用，不影响代码本身的 GPL 授权。其余模型
+（Real-ESRGAN BSD-3-Clause、RIFE Apache-2.0）无此限制。</p>
+<p style="color:#999;">免责声明：本项目按「现状」提供，不对播放效果、硬件兼容性或任何使用后果作担保；
+自行编译引擎、替换模型、或接入第三方 mpv 构建的风险由使用者自行承担。</p>"""
+
+
+def show_about(parent) -> None:
+    """标准 About 对话框：图标 + 应用名 + 作者 + 开源/协议声明 + 依赖出处 + 免责。"""
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("关于 mpv - feiyuplayer")
+    dlg.setWindowIcon(QIcon(str(ROOT / "console.ico")))
+    dlg.setMinimumWidth(540)
+    dlg.setMinimumHeight(420)
+
+    ico = QLabel()
+    # 作者头像优先（docs/avatar.png），缺了回落到控制台图标
+    pm = QPixmap(str(ROOT / "docs" / "avatar.png"))
+    if pm.isNull():
+        pm = QPixmap(str(ROOT / "console.ico"))
+    if not pm.isNull():
+        ico.setPixmap(pm.scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    title = QLabel("<b>mpv - feiyuplayer</b>")
+    title.setFont(QFont("", 14))
+    sub = QLabel("mpv 实时超分 + 补帧 控制台")
+    sub.setStyleSheet("color: #888;")
+    head = QHBoxLayout()
+    head.addWidget(ico)
+    hl = QVBoxLayout()
+    hl.addWidget(title)
+    hl.addWidget(sub)
+    head.addLayout(hl)
+    head.addStretch(1)
+
+    body = QTextBrowser()
+    body.setOpenExternalLinks(True)
+    body.setHtml(ABOUT_HTML)
+
+    btn_license = QPushButton("查看完整许可证")
+    btn_license.clicked.connect(
+        lambda: (QDesktopServices.openUrl(QUrl.fromLocalFile(str(ROOT / "LICENSE")))
+                 if (ROOT / "LICENSE").is_file()
+                 else QMessageBox.information(dlg, "许可证", "未找到 LICENSE 文件。"))
+    )
+    btn_ok = QPushButton("确定")
+    btn_ok.setDefault(True)
+    btn_ok.clicked.connect(dlg.accept)
+
+    bl = QHBoxLayout()
+    bl.addWidget(btn_license)
+    bl.addStretch(1)
+    bl.addWidget(btn_ok)
+
+    v = QVBoxLayout(dlg)
+    v.addLayout(head)
+    v.addWidget(body, 1)
+    v.addLayout(bl)
+    dlg.exec()
+
+
+
+
+# ★ 外部 mpv（如 mpv-lazy 这种**自带完整 VapourSynth + Python 环境**的便携包）
+#   不能用本项目超分的直接原因：Windows 的 DLL 搜索顺序是
+#   「应用程序目录(mpv.exe 同级) 优先于 PATH」。这类 mpv 同级自带
+#   `VSScript.dll` + `VSScriptPython38.dll` + `python3xx.dll` + `Lib/`，
+#   → mpv 加载 `vf=vapoursynth` 时永远先抢到**它自己那套** VSScript
+#   → 绑定它自己的 Python → `live.vpy` 跑在它的环境里，缺本项目的
+#   `sr_engine` / `live_static` / `vsmlrt` → 超分**静默失败**（视频照常放）。
+#   解决办法：启动前把外部 mpv 同级的 VSScript*.dll 临时改名让位，
+#   mpv 在应用目录找不到 → 沿 PATH 回落到本项目 .venv 的 VSScript → 超分生效。
+#   退出时（finished）还原；下次启动先清残留，防上次崩溃没还原把 lazy 的 VS 弄废。
+_VS_DLL_NAMES = ("VSScript.dll", "VSScriptPython38.dll")
+
+
+def _neutralize_external_vs(mpv: Path) -> list[Path]:
+    """临时让外部 mpv 同级的 VSScript*.dll 让位，返回被改名的原文件列表。
+
+    返回空列表 = 该 mpv 没有自带 VS（无需处理，行为同自带 mpv）。
+    """
+    touched: list[Path] = []
+    d = mpv.parent
+    # 1) 先清残留：上次若崩了没还原，这里把 .vsbak 还原回去
+    for bak in d.glob("VSScript*.dll.vsbak"):
+        orig = bak.with_suffix("")  # 去掉末尾 .vsbak → .dll
+        try:
+            if not orig.exists():
+                bak.rename(orig)
+        except OSError:
+            pass
+    # 2) 再让位当前要用的
+    for name in _VS_DLL_NAMES:
+        f = d / name
+        if f.is_file():
+            try:
+                f.rename(d / (name + ".vsbak"))
+                touched.append(f)
+            except OSError:
+                pass
+    return touched
+
+
+def _restore_external_vs(touched: list[Path]) -> None:
+    """把 _neutralize_external_vs 改名的 dll 还原回去。"""
+    for f in touched:
+        bak = f.parent / (f.name + ".vsbak")
+        try:
+            if bak.is_file():
+                bak.rename(f)
+        except OSError:
+            pass
 
 
 def pick_ladder(w: int, h: int, sr: str, srmax: int = 0,
@@ -355,7 +511,20 @@ def pick_ladder(w: int, h: int, sr: str, srmax: int = 0,
         cands = [t for t in lad if t[0] >= w]
     if cands:
         return min(cands, key=lambda t: t[0] * t[1])
-    return max(lad, key=lambda t: t[0] * t[1])
+    # ★ ③ 源比所有档都宽 → 在**比例接近**的档里取**面积最大**的那个。
+    #   ⚠ 两个坑都踩过（2026-10-02）：
+    #     · 按面积挑 → live.vpy 的 LIVE_SR_BUILD 会按源尺寸现编引擎，那些尺寸也进
+    #       sr_ladder（如 2242x1080，比例 2.076、面积 2.42M），会把 16:9 的 4K 源
+    #       抢走 → 中间多跑一趟非等比形变；
+    #     · 按"绝对偏差最小"挑 → 854x480(1.7792) 对 2.076 的偏差只比 1280x720
+    #       (1.7778) 小 0.0014，降档时会白白选到更小的档、白丢画质。
+    #   ⇒ 5% 相对容差圈出"比例差不多"的档，再取面积最大的。必须与 live.vpy 一字不差。
+    _d = [abs(t[0] / t[1] - ar) for t in lad]
+    #   容差下限取 **ar 的 1%**：640x360 / 1280x720 / 854x480 都是 16:9，必须算同一
+    #   比例档，否则会为了 0.0014 的偏差选到更小的那个。与 live.vpy 一字不差。
+    _tol = max(min(_d) * 1.05, ar * 0.01)
+    _near = [t for t in lad if abs(t[0] / t[1] - ar) <= _tol]
+    return max(_near, key=lambda t: t[0] * t[1])
 
 
 def capped_play_size(w: int, h: int, scale: float,
@@ -450,10 +619,16 @@ def estimate(order: str, sr: str, up: bool, ip: bool, w: int, h: int,
     return ms, ("插值" if pts[0][0] <= px <= pts[-1][0] else "外推")
 
 
-def build_launch(cfg: dict, files: list[str], pipe: str) -> tuple[dict, list[str]]:
+def build_launch(cfg: dict, files: list[str], pipe: str,
+                 vfr: bool = False,
+                 real_fps: float = 0.0) -> tuple[dict, list[str]]:
     """纯函数：把界面配置翻译成 (LIVE_* 环境变量, mpv 参数)。
 
     抽出来是为了能离线断言 —— 参数拼错一个字母，界面上完全看不出来。
+    `vfr`      = 首个文件实测是**可变帧率**（见 `ProbeWorker._probe_vfr`）。
+                 True → env `LIVE_VFR=1`（live.vpy 跳过 AssumeFPS），
+                 并（有 real_fps 时）覆盖容器帧率 **只为让显示对**，详见下面那段。
+    `real_fps` = 实测平均帧率；0 = 不知道，不覆盖。
     """
     up = bool(cfg["upscale"])
     ip = bool(cfg["interp"])
@@ -485,6 +660,8 @@ def build_launch(cfg: dict, files: list[str], pipe: str) -> tuple[dict, list[str
         "LIVE_STREAMS": str(cfg["streams"]),
         "LIVE_MATRIX": str(cfg["matrix"]),
         "LIVE_VERBOSE": "1" if cfg["verbose"] else "0",
+        # ★ VFR 源：让 live.vpy **跳过 AssumeFPS**（详见文件末尾「VFR 源」段）。
+        "LIVE_VFR": "1" if vfr else "0",
     }
     # ★★ 音频缓冲：mpv 默认 0.2，这里历史上用的是 0.6（3 倍）。
     #   mpv 官方文档原文（--audio-buffer）：
@@ -547,6 +724,12 @@ def build_launch(cfg: dict, files: list[str], pipe: str) -> tuple[dict, list[str
     #   真正的作用是让它显式、易读。
     if cfg.get("fullscreen"):
         args.insert(0, "--fullscreen")
+    # ★ 在画面上显示统计（默认开）：`--osd-level=3` 才会显示 level 3 的 OSD 消息，
+    #   GUI 每秒用 IPC 推一行 `show-text` 上去 —— 位置在**左上角小字**，和 mpv
+    #   自己的状态行（时间/进度）**分两行、互不覆盖**（截图实测过）。
+    #   关掉 = 回到 osd-level 默认（1）：mpv 连自己的状态行都不显示。
+    if cfg.get("osd_stat", True):
+        args.append("--osd-level=3")
     if cfg["mpv_verbose"]:
         args.append("--msg-level=all=info")
     # ★ 音频延迟微调（LIVE_AUDIO_DELAY，秒，可负）：音画错位按耳朵校准用。
@@ -590,6 +773,45 @@ def build_launch(cfg: dict, files: list[str], pipe: str) -> tuple[dict, list[str
                 _new.append(a)
         args = _new
         print("[info] LIVE_SHOW_TC=1：左上角烧录「画面内容时间戳」（诊断用，会略增 CPU）")
+    # ★★★ 2026-10-01 定案：修「VFR 源（rmvb 这类「容器帧率 ≠ 真实帧率」的假 CFR）
+    #   超分/补帧后音画持续漂移」。
+    #
+    #   机制：mpv 给 VS 的帧**带真实的逐帧时长**（探针实测 `_DurationNum=83000/1000000`
+    #   = 0.083s，逐帧在 0.042 / 0.083 之间跳 —— 这就是 VFR 的真身）。但这类源的
+    #   容器头写的是 `r_frame_rate`（本片写 30fps，真实平均只有 **18.71fps**），
+    #   于是 live.vpy 开头的 `AssumeFPS(container_fps=30)` 把**逐帧时长全拍平成 1/30**
+    #   → 视频时间轴按假帧率匀速走 → 与音频持续漂移、且随时间累积。
+    #   全程 `avsync`≈0（mpv 拿自己那套错的时间轴跟自己比）、`frame-drop-count`=0
+    #   —— **mpv 自己完全看不见**，只有烧 pts / 数帧数才看得见。
+    #
+    #   ⚠ 别用 `--container-fps-override` 去"修**时间轴**"（2026-10-01 走过的弯路）：
+    #     · 它只是把 AssumeFPS 的输入从「假的 30」换成「采样出的另一个数」，
+    #       **仍然是拍平**，总时长照样对不上 —— 本片按采样值 22.8fps 算，
+    #       25997 帧 = 1140s ≠ 音频 1389.76s；
+    #     · 这类源片内帧率本身就在漂（实测 0s→22.80、600s→14.73、1350s→21.20），
+    #       **不存在一个能覆盖全片的单一帧率**；
+    #     · 而且它会反过来改掉 mpv 注入的 `_DurationNum`（实测把它设成 23.5 后，
+    #       输入帧时长跟着变成 2/47），等于把真值也一并弄脏。
+    #
+    #   ✓ 正解：**VFR 源根本不要 AssumeFPS** —— 保留 mpv 给的原始逐帧时长，时间轴
+    #     自然正确（实测 400 帧：不做 = **17.0s**（真值）/ 做了 = 13.0s）。
+    #     超分不改帧数、也不丢时长属性（实测「跳过 AssumeFPS + TRT 超分」= 17.0s ✓），
+    #     所以超分照常。判别放在 GUI 侧 `ProbeWorker._probe_vfr`（VS 构建期读不到真实
+    #     帧，理由见 live.vpy 里的说明），结果走 env `LIVE_VFR=1`。
+    #     代价：补帧必须要恒定帧率，VFR 源会**自动跳过补帧**（live.vpy 里 src.fps=0
+    #     → interp_multi 返回 0 → 打日志跳过）。
+    #   ⚠ 正常 CFR 片源一律 `LIVE_VFR=0`，行为完全不变。
+    #
+    #   （这一段没有 mpv 参数要加：开关走的是 env 字典里的 LIVE_VFR。）
+    #
+    # ★ VFR 源：**不加** `--container-fps-override`。
+    #   2026-10-02 实测（D.Gray-man RV40 VFR）：加与不加，VS 层输出帧的 `_DurationNum`
+    #   完全相同（0.042 / 0.083 真实间隔）、mpv 的 `duration` / `estimated-vf-fps` 也
+    #   一模一样 → 该参数在此场景**无任何效果**（原意是想让统计页别显示文件头写的假
+    #   帧率，实测根本改不动）。既然无效又可能在别的 mpv/源组合下反噬 `_DurationNum`，
+    #   干脆不加：时间轴完全交给 mpv 注入的真实逐帧时长（live.vpy 已跳过 AssumeFPS）。
+    _ = (vfr, real_fps)                             # 保留形参，行为：不加任何参数
+
     args += files
     return env, args
 
@@ -754,9 +976,15 @@ class LineSplitter:
 # ═════════════════════════════════════════════════════════════ 后台：探分辨率
 
 class ProbeWorker(QThread):
-    """用 ffmpeg 读容器头拿分辨率和帧率（不解码），供预估和 auto 判断用。"""
+    """用 ffmpeg 读容器头拿分辨率和帧率（不解码），供预估和 auto 判断用。
+
+    ★ 2026-10-01 追加 `vfr`：容器头写的帧率**可能是假的**（rmvb 这类 VFR 冒充
+      CFR），必须真解一段才知道。只对**第一个**文件做（要解码，约 1 秒）。
+    """
 
     probed = Signal(str, int, int, float)          # (path, w, h, fps)
+    vfr = Signal(str, bool, float)                 # (path, 是否VFR, 实测平均fps)
+    vfr_done = Signal(str)                          # (path) VFR 判定**完成**（无论结果）
 
     def __init__(self, paths: list[str], parent=None) -> None:
         super().__init__(parent)
@@ -764,12 +992,70 @@ class ProbeWorker(QThread):
         self._stop = False
 
     def run(self) -> None:
-        for p in self.paths:
+        for i, p in enumerate(self.paths):
             if self._stop:
                 return
             wh = self._probe(p)
             if wh:
                 self.probed.emit(p, wh[0], wh[1], wh[2])
+            if i == 0:
+                is_vfr, rf = self._probe_vfr(p)
+                self.vfr_done.emit(p)               # 判定完成（含 CFR）→ _start 据此避免"首次未判定"
+                if is_vfr or rf > 0:
+                    self.vfr.emit(p, is_vfr, rf)
+
+    @staticmethod
+    def _probe_vfr(path: str, seconds: int = 15) -> tuple[bool, float]:
+        """真解前 N 秒 → `(是否可变帧率, 实测平均 fps)`。
+
+        为什么非解不可：容器帧率是**元数据**，rmvb 这类 VFR 会写死一个假值
+        （本机实测 D.Gray-man：头里 30fps，真实平均 **18.71fps**）。ffprobe
+        只会照抄那个假值，只有解码才知道真相。
+
+        ★ VFR 判据 = **逐帧 pts 间隔不均**：CFR 源即便 29.97fps 抖动也只有
+          几个百分点，而本片在 42ms / 83ms 之间整倍跳（max/min = 2.0）。
+          取阈值 1.5 倍，两头都留足余量。
+        ⚠ 不能拿 ffmpeg 的 `duration_time` 判 —— 它照抄 filter 的固定
+          frame_rate，恒为 0.033，什么也看不出来（踩过）。要看 `pts_time`。
+
+        成本：848x480 rv40 解 15 秒 ≈ 1 秒墙钟；只对首个文件做一次。
+        """
+        if not FFMPEG.is_file():
+            return (False, 0.0)
+        try:
+            r = subprocess.run(
+                [str(FFMPEG), "-hide_banner", "-nostdin",
+                 "-t", str(seconds), "-i", path,
+                 "-map", "0:v:0", "-an", "-sn", "-dn",
+                 "-vf", "showinfo", "-f", "null", "-"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            txt = r.stdout.decode("utf-8", "replace")
+        except Exception:
+            return (False, 0.0)
+
+        # ── VFR 判定：逐帧 pts 间隔
+        pts = [float(x) for x in re.findall(r"pts_time:([0-9.]+)", txt)]
+        is_vfr = False
+        if len(pts) >= 10:
+            diffs = [d for d in (pts[i + 1] - pts[i] for i in range(len(pts) - 1))
+                     if d > 0]
+            if diffs and min(diffs) > 0:
+                is_vfr = (max(diffs) / min(diffs)) > 1.5
+
+        # ── 实测平均帧率（ffmpeg 的进度行，\r 分段里抓最后一个）
+        fps = 0.0
+        fr = re.findall(r"frame=\s*(\d+)", txt)
+        tm = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", txt)
+        if fr and tm:
+            n = int(fr[-1])
+            hh, mm, ss = tm[-1]
+            secs = int(hh) * 3600 + int(mm) * 60 + float(ss)
+            if n >= 10 and secs >= 1.0:
+                fps = n / secs
+        return (is_vfr, fps)
 
     @staticmethod
     def _probe(path: str):
@@ -817,9 +1103,14 @@ class MpvStat(QThread):
     observe_property 之后 mpv 会在属性变化时主动推送，readline() 就有数据可读。
     轮询式 get_property 需要非阻塞读，Windows 命名管道没现成办法。
 
-    关键指标是 `estimated-vf-fps`：它是**视频滤镜输出**的实际帧率，
-    也就是"超分 + 补帧到底跑不跑得动"的直接答案。补帧 2x 后目标是 48，
-    若实际只有 30 就说明处理跟不上、mpv 在丢帧保同步。
+    ★★ 2026-10-02 更正：早先这里把 `estimated-vf-fps` 当成"滤镜实际跑出来的帧率"
+      —— **不对**。它是**滤镜链声明的输出帧率**（`estimated` = 推算，不是实测）：
+      超分不改帧率 → 它就等于**源帧率**；补帧 2x → 48。**全程恒定不动**，
+      反映不了真实速度。真正的实测只有两条路（本类都采了）：
+        · `estimated-frame-number` 差分 → 播放推进速率（mpv 降速慢放时它会掉下来）；
+        · `frame-drop-count` 差分 → 丢帧速率 ⇒ **实际显示 = 输出 − 丢帧**。
+      mpv **没有**"实测渲染 fps"这个属性：`estimated-display-fps` 在本机 mpv 0.41
+      上**恒 unavailable**（真窗口 + `--vo=gpu` 实测确认），所以只能这样推。
 
     ★ 不用信号传数据：走 Signal 要跨线程逐次拷贝。改成「写时复制」——每次都整体
     替换 `snapshot` 的引用，界面直接读这个引用，**零锁且永远是自洽快照**。
@@ -832,22 +1123,23 @@ class MpvStat(QThread):
     """
 
     PROPS = {
-        1: "estimated-vf-fps",          # 滤镜输出实际帧率 ★
+        1: "estimated-vf-fps",          # 滤镜链**声明**的输出帧率（恒定，见类注释）
         2: "frame-drop-count",          # 显示层丢帧
-        3: "mistimed-frame-count",      # 晚点帧（A/V 同步补偿）
+        3: "mistimed-frame-count",      # 晚点帧（本机 mpv 0.41 恒 unavailable）
         4: "decoder-frame-drop-count",  # 解码器丢帧
         5: "vo-delayed-frame-count",    # 渲染队列积压
         6: "time-pos",
         7: "duration",
         8: "media-title",
-        9: "video-params/w",
-        10: "video-params/h",
-        11: "estimated-frame-rate",     # 输出帧率（由 VS 设定）
+        9: "video-out-params/w",        # ★ 滤镜链**之后**的尺寸（超分后的真实输出）
+        10: "video-out-params/h",
+        11: "estimated-frame-number",   # ★ 实测帧号，递增 → 差分即真实帧率
         12: "pause",
         13: "playlist-pos",
         14: "playlist-count",
         15: "cache-speed",
         16: "demuxer-cache-duration",
+        17: "display-fps",              # 显示器刷新率（真窗口下才有值）
     }
     BY_NAME = {v: k for k, v in PROPS.items()}
 
@@ -861,6 +1153,7 @@ class MpvStat(QThread):
         self.last_error = ""
         self._stop = False
         self._fh = None
+        self._wlock = threading.Lock()      # 保护 push() 与 run() 对管道的并发访问
 
     def run(self) -> None:
         deadline = time.time() + 8.0
@@ -908,9 +1201,109 @@ class MpvStat(QThread):
             except Exception:
                 pass
 
+    def push(self, command: list) -> bool:
+        """从**别的线程**投递一条 IPC 命令（不等回复）。成功返回 True。
+
+        ★ 命名管道是全双工的：本线程是唯一的读者，所以并发**写**不会跟读串味。
+          加锁只为挡住 `_fh` 被 run() 打开/关闭的那一瞬间。
+        """
+        data = json.dumps({"command": list(command)}).encode() + b"\n"
+        with self._wlock:
+            fh = self._fh
+            if fh is None or not self.opened:
+                return False
+            try:
+                fh.write(data)
+                return True
+            except (OSError, ValueError):
+                # 管道已断 / 文件已关（mpv 退出或崩溃）：标记失效，别再写
+                self._fh = None
+                self.opened = False
+                return False
+
     def stop(self) -> None:
         self._stop = True
 
+
+
+class SysStat(threading.Thread):
+    """每秒采集 GPU 利用率/显存、CPU 利用率（写时复制快照，同 MpvStat 的风格）。
+
+    ★ GPU 用 `nvidia-smi` 子进程而不是 pynvml：本机实测**单次只要 64ms**，
+      每秒一次毫无压力；nvidia-smi 跟着驱动走，比第三方包更不容易坏。
+      没装 pynvml 也不用往 .venv 里加依赖。
+    ★ CPU 用 psutil（GUI 环境已带 7.2.2）。`cpu_percent(interval=None)` 是
+      **非阻塞**的，返回「自上次调用以来」的平均值 —— 所以第一次调用返回 0，正常。
+    ★ `CREATE_NO_WINDOW`：GUI 进程里 spawn 子进程**不能弹黑框**。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(daemon=True)
+        self.snapshot: dict = {}
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            import psutil
+            psutil.cpu_percent(interval=None)       # 第一跳：建立基准
+            _ps = psutil
+        except Exception:
+            _ps = None
+        while not self._stop:
+            t0 = time.perf_counter()
+            snap: dict = {}
+            try:
+                out = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,"
+                                    "memory.used,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=3.0,
+                    creationflags=subprocess.CREATE_NO_WINDOW).stdout
+                _u, _mu, _mt = (x.strip() for x in out.strip().split(","))
+                snap = {"gpu_util": int(_u), "gpu_mem_used": int(_mu),
+                        "gpu_mem_total": int(_mt)}
+            except Exception:
+                pass                                 # 没 N 卡 / 驱动忙 → 本轮跳过
+            if _ps is not None:
+                try:
+                    snap["cpu_util"] = int(_ps.cpu_percent(interval=None))
+                except Exception:
+                    pass
+            if snap:
+                self.snapshot = snap                 # 写时复制：读方永远拿到自洽快照
+            time.sleep(max(0.2, 1.0 - (time.perf_counter() - t0)))
+
+
+def _hw_names() -> tuple[str, str]:
+    """一次性取 (GPU 短名, CPU 短名)，失败给空串。
+
+    GPU:  "NVIDIA GeForce RTX 4080" → "RTX 4080"（剥掉厂商前缀，OSD 上够用）
+    CPU:  "12th Gen Intel(R) Core(TM) i7-12700KF" → "i7-12700KF"（取型号 token；
+          AMD 的 "…Ryzen 9 7950X 16-Core Processor" 也走正则拿 "Ryzen 9 7950X"）
+    """
+    gpu = cpu = ""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=3.0,
+            creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        gpu = re.sub(r"^(NVIDIA\s+|GeForce\s+)+", "",
+                     out.strip().splitlines()[0], flags=re.I).strip()
+    except Exception:
+        pass
+    try:
+        import winreg
+        _k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+        _raw, _ = winreg.QueryValueEx(_k, "ProcessorNameString")
+        _m = re.search(r"(i[3579]-\w+|Ryzen[ \w]*?\d{3,5}\w*)", _raw, re.I)
+        cpu = _m.group(1) if _m else " ".join(_raw.split())
+    except Exception:
+        pass
+    return gpu, cpu
 
 
 # ═══════════════════════════════════════════════════════════════════ 主窗口
@@ -960,7 +1353,8 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("mpv 实时超分 + 补帧 控制台")
+        self.setWindowTitle("mpv - feiyuplayer")
+        self.setWindowIcon(QIcon(str(ROOT / "console.ico")))
         # ★ 2026-09-30：按**屏幕可用尺寸**算初始窗口，别写死小尺寸。
         #   本机屏 2560x1400，原来写死的 1260x900 在参数面板加宽到 520 后
         #   会把参数区压到必须滚动（内容 ~780px > 可用 ~430px）。
@@ -978,6 +1372,14 @@ class MainWindow(QMainWindow):
 
         self.cfg = load_cfg()
         self.media: dict[str, tuple[int, int, float]] = {}
+        # 首个文件的 VFR 判定 + 实测平均帧率（解码数出来的），键同 media。
+        # 用来判容器帧率是不是假的（rmvb 这类 VFR 冒充 CFR），见 ProbeWorker._probe_vfr。
+        self.vfr_src: dict[str, tuple[bool, float]] = {}
+        # 已完成 VFR 判定的文件（含 CFR）—— _start 据此判断"是否还需同步补判"
+        self._vfr_ready: set[str] = set()
+        # 超分引擎预热：已预建/在建的 "模型@WxH" 标签 + 在跑的 QProcess（防重复/防 GC）
+        self._warm_tags: set[str] = set()
+        self._warm_procs: list = []
         self.engines = self._scan_engines()
         self._probe_worker: ProbeWorker | None = None
         self._stat: MpvStat | None = None
@@ -988,9 +1390,14 @@ class MainWindow(QMainWindow):
         # 运行时状态（由 mpv IPC 推送，UI 定时刷新）
         self._fps_hist: list[tuple[float, float]] = []      # (monotonic, vf_fps)
         self._drop_hist: list[tuple[float, int]] = []       # (monotonic, 累计丢帧)
+        self._fno_hist: list[tuple[float, int]] = []        # (monotonic, 实测帧号)
         self._target_fps = 48.0
         self._plan_fps: float | None = None
         self._last_stat_log = 0.0
+        self._last_osd_push = 0.0        # 上次把统计推给 mpv OSD 的时刻
+        # 硬件型号（静态，启动时拿一次）；SysStat 在播放开始时才启动
+        self._gpu_short, self._cpu_short = _hw_names()
+        self._sys: SysStat | None = None
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(250)
         self._ui_timer.timeout.connect(self._refresh_live)
@@ -1009,8 +1416,8 @@ class MainWindow(QMainWindow):
         self._refresh_enabled()
         self._update_plan()
         self._log(f"[控制台] 工作目录 {ROOT}\n")
-        if not MPV.is_file():
-            self._log(f"[控制台][!] 找不到 {MPV}\n")
+        if not resolve_mpv(self.cfg.get("mpv_path")).is_file():
+            self._log(f"[控制台][!] 找不到 {resolve_mpv(self.cfg.get('mpv_path'))}\n")
         if not VSROOT.is_dir():
             self._log(f"[控制台][!] 找不到 {VSROOT}（VapourSynth 位置）\n")
 
@@ -1539,7 +1946,10 @@ class MainWindow(QMainWindow):
             "  4.25 lite  **tile 分块的轻量版**：更省显存、更快一些，\n"
             "    代价是输入尺寸要凑 **128 的倍数**\n"
             "    （pad 的那几行黑边插完会裁掉，不影响画面）。\n"
-            "  4.9 / 4.4  旧版，速度接近 lite。\n"
+            "\n"
+            "★ 4.26 已经是 RIFE 的**末代版本**（作者 2024-09 后转去做 LLM，\n"
+            "  2025 年明确说不再更了）—— 网上说的「4.6」是更老的版本，\n"
+            "  不是更新的。别被版本号大小骗到。\n"
             "\n"
             "⚠ 各档相对快慢**跟源分辨率、机器都有关** —— 这里不给耗时数字，\n"
             "  以你自己实跑为准。")
@@ -1636,6 +2046,30 @@ class MainWindow(QMainWindow):
         self.chk_mpvlog = QCheckBox("显示 mpv 详细日志")
         self.chk_mpvlog.setToolTip("加 --msg-level=all=info，排查解码/渲染问题时用")
         ga.addWidget(self.chk_mpvlog, 6, 0, 1, 2)
+        # ★ mpv 程序路径：GUI 里可换成任意 mpv 构建（如 mpv-lazy 的 mpv.exe）。
+        #   留空 = 用自带的 mpv/mpv.exe（resolve_mpv 回落）。
+        self.le_mpv = QLineEdit()
+        self.le_mpv.setPlaceholderText(f"默认：{MPV}（留空则用自带 mpv）")
+        self.le_mpv.setToolTip(
+            "指定要用的 mpv 程序。\n"
+            "留空 → 用本项目自带的 mpv/mpv.exe。\n"
+            "填了且文件存在 → 用那个（比如 D:\\mpv-lazy\\mpv.exe）。\n"
+            "可点右侧「浏览…」选，或手动粘贴路径。")
+        self.btn_mpv_br = QPushButton("浏览…")
+        self.btn_mpv_br.clicked.connect(self._browse_mpv)
+        _mpv_row = QWidget()
+        _mpv_hl = QHBoxLayout(_mpv_row)
+        _mpv_hl.setContentsMargins(0, 0, 0, 0)
+        _mpv_hl.addWidget(self.le_mpv, 1)
+        _mpv_hl.addWidget(self.btn_mpv_br)
+        ga.addWidget(QLabel("mpv 程序"), 8, 0)
+        ga.addWidget(_mpv_row, 8, 1)
+        self.chk_osd = QCheckBox("画面上显示统计")
+        self.chk_osd.setToolTip(
+            "把「实时 / 输出 / 实际显示 fps · 丢帧 · 输出分辨率 · 刷新率」用 mpv 的\n"
+            "OSD 打在画面左上角小字（和 mpv 自己的时间/进度行分两行，互不覆盖）。\n"
+            "全屏播放时不用切回这个窗口看。实现：--osd-level=3 + 每秒一次 show-text。")
+        ga.addWidget(self.chk_osd, 7, 0, 1, 2)
         pv.addWidget(g_ad)
 
         # ⚠ 这里**不要** addStretch —— 它会把 host 的 sizeHint 撑到视口高度，
@@ -1692,12 +2126,17 @@ class MainWindow(QMainWindow):
             lambda: subprocess.Popen(["explorer", str(ROOT)]))
         rv.addWidget(self.btn_selfcheck, 2, 0, 1, 2)
         rv.addWidget(self.btn_open, 3, 0, 1, 2)
+        self.btn_about = QPushButton("关于")
+        self.btn_about.setToolTip("作者 / 开源协议 / 依赖出处")
+        self.btn_about.clicked.connect(lambda: show_about(self))
+        rv.addWidget(self.btn_about, 4, 0, 1, 2)
         sv.addWidget(run)
 
         # 接线（只改状态，末尾统一调 _refresh_enabled / _update_plan）
         for w in (self.chk_up, self.chk_ip, self.chk_verbose, self.chk_mpvlog,
-                  self.chk_fs):
+                  self.chk_osd, self.chk_fs):
             w.toggled.connect(self._on_toggle)
+        self.le_mpv.textChanged.connect(self._on_toggle)
         for w in (self.cb_sr, self.cb_srmax, self.cb_srmax_edge, self.cb_multi,
                   self.cb_order, self.cb_matrix, self.cb_rifev, self.cb_vfi,
                   self.cb_mv, self.cb_play_h, self.cb_cap_edge):
@@ -1788,6 +2227,8 @@ class MainWindow(QMainWindow):
         self.chk_ip.setChecked(bool(c["interp"]))
         self.chk_verbose.setChecked(bool(c["verbose"]))
         self.chk_mpvlog.setChecked(bool(c["mpv_verbose"]))
+        self.le_mpv.setText(str(c.get("mpv_path") or ""))
+        self.chk_osd.setChecked(bool(c.get("osd_stat", True)))
         # ★ 老配置里没有 fullscreen 这个键 → c.get 兜底 False（保持窗口模式）
         self.chk_fs.setChecked(bool(c.get("fullscreen", False)))
         for cb, key in ((self.cb_sr, "sr"), (self.cb_rifev, "rife_ver"),
@@ -1838,6 +2279,7 @@ class MainWindow(QMainWindow):
             "interp": self.chk_ip.isChecked(),
             "verbose": self.chk_verbose.isChecked(),
             "mpv_verbose": self.chk_mpvlog.isChecked(),
+            "osd_stat": self.chk_osd.isChecked(),
             "sr": self.cb_sr.currentData(),
             "rife_ver": self.cb_rifev.currentData(),
             "vfi": self.cb_vfi.currentData(),
@@ -1859,6 +2301,7 @@ class MainWindow(QMainWindow):
             "device": self.sp_dev.value(),
             "streams": self.sp_streams.value(),
             "concurrent": self.sp_conc.value(),
+            "mpv_path": self.le_mpv.text().strip(),
             "files": [self.lst_files.item(i).data(Qt.UserRole)
                       for i in range(self.lst_files.count())],
             "last_in_dir": self.cfg.get("last_in_dir", ""),
@@ -1892,12 +2335,21 @@ class MainWindow(QMainWindow):
                 if m == keep:
                     self.cb_sr.setCurrentIndex(i)
         else:
-            _avail = sr_available()
-            if not _avail:
-                self.cb_sr.addItem(
-                    "（没有可用引擎，先跑 build_*_engines.py）", "animev3")
-            for i, (key, disp, sc, lad) in enumerate(_avail):
+            # ★★ 恒列出全部 TRT 模型 —— **不再按"本机有没有 .engine"过滤**。
+            #   用户要求：不能指望使用者先去跑 build_*_engines.py。
+            #   没引擎时由 live.vpy 的 LIVE_SR_BUILD 按**源尺寸**现场编译
+            #   （首次遇该分辨率稍慢，之后缓存秒开）。
+            #   引擎状态放 tooltip，不占显示名宽度（否则长名被省略号截断）。
+            for i, (key, disp, sc, _d, _pfx) in enumerate(SR_MODELS):
                 self.cb_sr.addItem(disp, key)
+                _lad = sr_ladder(key)
+                if _lad:
+                    _tip = (f"LIVE_SR = {key}\n\n已编译档位（{len(_lad)} 个）："
+                            + "、".join(f"{w}×{h}" for w, h in _lad))
+                else:
+                    _tip = (f"LIVE_SR = {key}\n\n本机还没有这个模型的 .engine —— "
+                            "播放时会按**源尺寸**现场编译（首次该分辨率稍慢，之后缓存秒开）。")
+                self.cb_sr.setItemData(i, _tip, Qt.ToolTipRole)
                 if key == keep:
                     self.cb_sr.setCurrentIndex(i)
         self.cb_sr.blockSignals(False)
@@ -1906,6 +2358,7 @@ class MainWindow(QMainWindow):
         self._fill_sr_models()
         self._refresh_enabled()
         self._update_plan()
+        self._warm_sr_engine()          # 换模型后也把已导入视频的引擎备好
 
     # ── 限定播放分辨率：预设 / 自定义 二选一 ─────────────────
     def _on_cap_mode(self, *_) -> None:
@@ -2267,8 +2720,38 @@ class MainWindow(QMainWindow):
             return
         w = ProbeWorker(todo, self)
         w.probed.connect(self._on_probed)
+        w.vfr.connect(self._on_vfr)
+        w.vfr_done.connect(self._on_vfr_done)
         w.start()
         self._probe_worker = w
+
+    def _on_vfr_done(self, path: str) -> None:
+        """VFR 判定完成（含 CFR）→ 记录，避免 `_start` 时还没判完导致"首次播放时间轴乱"。"""
+        self._vfr_ready.add(path)
+
+    def _on_vfr(self, path: str, is_vfr: bool, fps: float) -> None:
+        """记下 VFR 判定（修「VFR 源超分/补帧后音画漂移」用）。"""
+        self.vfr_src[path] = (is_vfr, fps)
+        if not is_vfr:
+            return
+        cf = self.media.get(path, (0, 0, 0.0))[2]
+        _real = f"实测平均 {fps:.3g}fps" if fps > 0 else "帧率不固定"
+        # 列表里标出来（`w×h 30fps` → `w×h 22.8fps VFR`）—— 一眼看得出哪集不适用补帧
+        w, h = self.media.get(path, (0, 0, 0.0))[:2]
+        for i in range(self.lst_files.count()):
+            it = self.lst_files.item(i)
+            if it.data(Qt.UserRole) == path:
+                if w and h:
+                    it.setText(f"{Path(path).name}\n{w}×{h}　{fps:.3g}fps　VFR")
+                break
+        self._log(f"[控制台][!] 该片源是**可变帧率（VFR）**"
+                  f"（容器头写 {cf:.3g}fps，{_real}）\n"
+                  f"           → 播放时保留原始时间轴（不做 AssumeFPS），"
+                  f"以免音画持续漂移\n"
+                  f"           → 统计页 / OSD 的 FPS 会按实测值显示"
+                  f"（不再是被写死的 {cf:.3g}，所以「跑不满 30」是正常的）\n"
+                  f"           → 代价：该片不能用补帧（补帧要恒定帧率），超分不受影响\n")
+        self._update_plan()
 
     def _on_probed(self, path: str, w: int, h: int, fps: float) -> None:
         self.media[path] = (w, h, fps)
@@ -2279,6 +2762,67 @@ class MainWindow(QMainWindow):
                 break
         self._refresh_enabled()   # 拿到分辨率才能算「本片走哪档」
         self._update_plan()
+        # ★ 导入即按源尺寸把超分引擎备好（用户要求：不指望用户自己跑 build 脚本）
+        self._warm_sr_engine(path)
+
+    # ── 超分引擎预热：导入视频后按源尺寸后台预建 TRT 引擎 ─────────────
+    def _warm_sr_engine(self, path: str | None = None) -> None:
+        """按「当前模型 + 已导入视频的源尺寸」后台预建 TRT 引擎。
+
+        用户要求：不能指望使用者自己去跑 build_*_engines.py —— 导入视频后
+        就该把该尺寸的引擎备好。已有缓存则跳过；缺则用 `.venv` 起一个
+        **独立进程**跑 sr_engine.py（GUI 进程绝不 import vapoursynth）。
+        """
+        try:
+            if self.cb_sreng.currentData() == "a4k":
+                return
+            key = str(self.cb_sr.currentData() or "")
+            if not key or key.lower().startswith("anime4kcpp"):
+                return
+            if path is None:
+                it = self.lst_files.currentItem()
+                if it is None and self.lst_files.count():
+                    it = self.lst_files.item(0)
+                path = it.data(Qt.UserRole) if it else None
+            wh = self.media.get(path) if path else None
+            if not wh or not wh[0] or not wh[1]:
+                return
+            w, h = int(wh[0]), int(wh[1])
+            if any(w == a and h == b for a, b in sr_ladder(key)):
+                return                                  # 该尺寸已有引擎，无需编
+            if not VS_PY.is_file() or not (ROOT / "sr_engine.py").is_file():
+                return                                  # 没自包含环境 → 交给 live.vpy 播放时现编
+            tag = f"{key}@{w}x{h}"
+            if tag in self._warm_tags:
+                return                                  # 已在建/建过
+            self._warm_tags.add(tag)
+        except Exception:
+            return
+
+        self._log(f"[控制台][i] 本机没有 {key} 在 {w}×{h} 的引擎 → "
+                  f"后台预建（约 10~20 秒，编完缓存，同尺寸下次秒开）\n")
+        qp = QProcess(self)
+        qp.setProcessChannelMode(QProcess.MergedChannels)
+        qp.finished.connect(
+            lambda code, st, _k=key, _w=w, _h=h, _q=qp:
+            self._on_warm_done(_k, _w, _h, code, _q))
+        qp.start(str(VS_PY), [str(ROOT / "sr_engine.py"), key, f"{w}x{h}"])
+        self._warm_procs.append(qp)
+
+    def _on_warm_done(self, key: str, w: int, h: int, code: int, qp) -> None:
+        out = bytes(qp.readAllStandardOutput()).decode("utf-8", "replace").strip()
+        ok = (code == 0 and any(w == a and h == b for a, b in sr_ladder(key)))
+        self._log(f"[控制台][{'i' if ok else '!'}] 预建引擎 {key} {w}×{h} "
+                  f"{'完成' if ok else '失败'}"
+                  + (f"（{out.splitlines()[-1]}）" if out and not ok else "") + "\n")
+        if ok:
+            self._fill_sr_models()
+            self._update_plan()
+        try:
+            self._warm_procs.remove(qp)
+        except ValueError:
+            pass
+        qp.deleteLater()
 
     def _add_files(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -2344,6 +2888,15 @@ class MainWindow(QMainWindow):
 
     # ══════════════════════════════════════════════════════ 播放 / 停止
 
+    def _browse_mpv(self) -> None:
+        """浏览选择一个 mpv 程序，填入「mpv 程序」输入框。"""
+        p, _ = QFileDialog.getOpenFileName(
+            self, "选择 mpv 程序", str(ROOT / "mpv"),
+            "mpv 可执行文件 (*.exe);;所有文件 (*.*)")
+        if p:
+            self.le_mpv.setText(p)
+            self._on_toggle()
+
     def _start(self) -> None:
         if self.proc.state() != QProcess.NotRunning:
             return
@@ -2351,9 +2904,17 @@ class MainWindow(QMainWindow):
                  for i in range(self.lst_files.count())]
         if not files:
             return
-        if not MPV.is_file():
-            self._log(f"[控制台][X] 找不到 mpv：{MPV}\n")
+        cur = self._collect_cfg()
+        mpv = resolve_mpv(cur.get("mpv_path"))
+        if not mpv.is_file():
+            self._log(f"[控制台][X] 找不到 mpv：{mpv}\n")
             return
+        # ★ 外部 mpv 若自带 VSScript.dll（如 mpv-lazy），先临时让它让位，
+        #   否则超分链路会被它的 VapourSynth 环境抢走、静默失效。退出时还原。
+        self._vs_neutralized = _neutralize_external_vs(mpv)
+        if self._vs_neutralized:
+            self._log(f"[控制台][i] 外部 mpv 自带 VapourSynth，已临时让位"
+                      f" {len(self._vs_neutralized)} 个 dll（退出还原）\n")
 
         env = QProcessEnvironment.systemEnvironment()
         path = env.value("PATH") or ""
@@ -2361,7 +2922,29 @@ class MainWindow(QMainWindow):
         env.insert("PYTHONPATH", str(VSSP))
 
         pipe = rf"\\.\pipe\mpv-live-{os.getpid()}"
-        env_add, args = build_launch(self._collect_cfg(), files, pipe)
+        # ★ VFR 源（rmvb 这类容器帧率造假的）超分/补帧后音画漂移修复，
+        #   详见 build_launch 里那一大段。判到 VFR 就置 LIVE_VFR=1，
+        #   让 live.vpy 跳过 AssumeFPS、保留原始时间轴。
+        #   正常 CFR 片源 vfr=False，行为完全不变。
+        # ★ 首播前**确保** VFR 已判定：ProbeWorker 是异步的（要解码 ~15s），若用户
+        #   在探测完成前就点播放，vfr_src 还没有该文件 → 取到默认 (False,0) →
+        #   LIVE_VFR=0 → live.vpy 走 AssumeFPS(假 fps) → **时间轴被拍平**。
+        #   这正是「第一次播放乱、第二次就好」的病根（第二次探测已完成）。
+        #   这里对首个文件做一次**同步**补判（仅首次、约 1 秒），之后走缓存。
+        _first = files[0]
+        if _first not in self._vfr_ready:
+            self._log("[控制台][i] 首次播放：正在判定片源是否可变帧率（VFR）…\n")
+            try:
+                _iv, _rf = ProbeWorker._probe_vfr(_first)
+            except Exception:                            # noqa: BLE001
+                _iv, _rf = (False, 0.0)
+            self._vfr_ready.add(_first)
+            if _iv or _rf > 0:
+                self.vfr_src[_first] = (_iv, _rf)
+        _vfr_info = self.vfr_src.get(files[0], (False, 0.0))
+        env_add, args = build_launch(cur, files, pipe,
+                                     vfr=bool(_vfr_info[0]),
+                                     real_fps=float(_vfr_info[1]))
         for k, v in env_add.items():
             env.insert(k, v)
         self.proc.setProcessEnvironment(env)
@@ -2370,17 +2953,24 @@ class MainWindow(QMainWindow):
         self._last_was_replace = False
         self._fps_hist = []
         self._drop_hist = []
+        self._fno_hist = []
         self._play_t0 = time.monotonic()
         self._last_stat_log = self._play_t0
+        self._last_osd_push = self._play_t0
         self.log.clear()
         self._save_cfg()
 
         # 目标帧率：源帧率 × 补帧倍率
-        cur = self._collect_cfg()
         base = 24.0
         first = self.lst_files.item(0).data(Qt.UserRole)
         if first in self.media:
             base = self.media[first][2]
+        # ★ VFR 源：容器帧率是假的（实测会拍平成假时间轴），显示上换成实测平均帧率，
+        #   免得日志里报「目标 60fps」而实际补帧根本没跑（VFR 会跳过补帧）。
+        if first in self.vfr_src:
+            _is_vfr, _rf = self.vfr_src[first]
+            if _is_vfr and _rf > 0:
+                base = _rf
         self._target_fps = (resolve_target_fps(cur["interp_fps"], base)
                             if cur["interp"] else base)
         o0, s0, pms, ptag, w0, h0, _, _bf0 = self._current_plan()
@@ -2397,12 +2987,16 @@ class MainWindow(QMainWindow):
                   f"　目标 {self._target_fps:.0f} fps"
                   + (f"　预估处理 {self._plan_fps:.0f} fps（{ptag}）"
                      if self._plan_fps else "") + "\n")
-        self.proc.start(str(MPV), args)
+        self.proc.start(str(mpv), args)
         self.btn_run.setEnabled(False)
         self.btn_stop.setEnabled(True)
 
         self._stat = MpvStat(pipe, self)
         self._stat.start()
+        # GPU/CPU 采集线程（OSD 第二行用）：跟播放走，别在空闲时白烧
+        if self._sys is None or not self._sys.is_alive():
+            self._sys = SysStat()
+            self._sys.start()
         self._ui_timer.start()
 
     def _stop(self) -> None:
@@ -2422,6 +3016,10 @@ class MainWindow(QMainWindow):
             self.proc.kill()
 
     def _on_mpv_finished(self, code: int, status) -> None:
+        # ★ 还原被临时让位的外部 mpv 自带 VSScript.dll（让 lazy 等便携包恢复原状）
+        if getattr(self, "_vs_neutralized", None):
+            _restore_external_vs(self._vs_neutralized)
+            self._vs_neutralized = []
         if self._kill_timer:
             self._kill_timer.stop()
         self._ui_timer.stop()
@@ -2429,6 +3027,9 @@ class MainWindow(QMainWindow):
         if self._stat:
             self._stat.stop()
             self._stat = None
+        if self._sys is not None:
+            self._sys.stop()
+            self._sys = None
 
         stable = [v for t, v in self._fps_hist
                   if t - getattr(self, "_play_t0", t) > 3.0]
@@ -2478,7 +3079,7 @@ class MainWindow(QMainWindow):
         return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def _sample(self, d: dict) -> None:
-        """记录一次 vf-fps 与丢帧计数（界面每 250 ms 采一次）。"""
+        """记录一次 vf-fps / 丢帧计数 / **实测帧号**（界面每 250 ms 采一次）。"""
         now = time.monotonic()
         fps = d.get("estimated-vf-fps")
         if (not isinstance(fps, bool) and isinstance(fps, (int, float))
@@ -2491,6 +3092,13 @@ class MainWindow(QMainWindow):
             self._drop_hist.append((now, drop))
             if len(self._drop_hist) > 6000:
                 del self._drop_hist[:3000]
+        # ★ 实测帧号：mpv 推进到的帧号，**递增**。差分 = 真实播放帧率（见 _real_fps）。
+        #   它和 estimated-vf-fps 的区别就是"实测 vs 声明"。
+        fno = d.get("estimated-frame-number")
+        if isinstance(fno, int) and not isinstance(fno, bool):
+            self._fno_hist.append((now, fno))
+            if len(self._fno_hist) > 6000:
+                del self._fno_hist[:3000]
 
     def _drop_rate(self, window: float = 5.0) -> float:
         """每秒丢帧数 —— 这才是"实际卡不卡"的判据。
@@ -2522,8 +3130,31 @@ class MainWindow(QMainWindow):
             return None
         return sum(vals) / len(vals)
 
+    def _real_fps(self, window: float = 2.0):
+        """**实测**帧率 = 播放帧号的推进速率（帧/秒）；样本不足返回 None。
+
+        ★ 为什么必须另算一个（而不是直接用 `estimated-vf-fps`）：后者是滤镜链
+          **声明**要输出多少帧 —— 超分不改帧率，它就恒等于源帧率；补帧 2x 就恒
+          等于 48。**从头到尾一个数都不动**，看不出实际快慢。
+          `estimated-frame-number` 是 mpv 真正推进到的帧号，差值/时间差 = 真实帧率。
+        ★ 它能抓到 `estimated-vf-fps` 看不见的一种情况：**mpv 降速慢放**
+          （滤镜链供不上、又没有音轨时钟约束时，mpv 不丢帧而是放慢播放）——
+          那一刻实测帧率会明显低于源帧率，而"输出 fps"照样纹丝不动。
+        """
+        if len(self._fno_hist) < 2:
+            return None
+        now = time.monotonic()
+        pts = [(t, n) for t, n in self._fno_hist if now - t <= window]
+        if len(pts) < 2:
+            return None
+        dt = pts[-1][0] - pts[0][0]
+        if dt < 0.2:
+            return None
+        return max((pts[-1][1] - pts[0][1]) / dt, 0.0)
+
     @staticmethod
-    def render_live(d: dict, avg, tgt: float, drop_rate: float = 0.0) -> str:
+    def render_live(d: dict, avg, tgt: float, drop_rate: float = 0.0,
+                    real_fps=None) -> str:
         """把 mpv 属性快照渲染成状态面板的 HTML（纯函数，可离线断言）。
 
         判据用「实际显示帧率 = 输出帧率 − 丢帧速率」，而不是输出帧率本身 ——
@@ -2534,9 +3165,19 @@ class MainWindow(QMainWindow):
         mist = d.get("mistimed-frame-count") or 0
         ddec = d.get("decoder-frame-drop-count") or 0
         vdelay = d.get("vo-delayed-frame-count") or 0
-        ow, oh = d.get("video-params/w"), d.get("video-params/h")
+        # ★ 用 `video-out-params`（**滤镜链之后**）—— `video-params` 是解码器输出，
+        #   挂了超分滤镜之后它一直显示**源尺寸**：实测源 1280x720 时面板显示
+        #   `→ 1280×720`，而真实输出是 2560×1440（探针实测两种属性都查过）。
+        #   回退到 video-params 只为兼容旧快照。
+        ow, oh = d.get("video-out-params/w"), d.get("video-out-params/h")
+        if not (isinstance(ow, int) and isinstance(oh, int)):
+            ow, oh = d.get("video-params/w"), d.get("video-params/h")
         res = (f"{ow}×{oh}" if isinstance(ow, int) and isinstance(oh, int)
                else "—")
+        _disp = d.get("display-fps")
+        if (isinstance(_disp, (int, float)) and not isinstance(_disp, bool)
+                and _disp > 1):
+            res += f"　屏 {_disp:.0f}Hz"
         pos = MainWindow._fmt_time(d.get("time-pos"))
         dur = MainWindow._fmt_time(d.get("duration"))
         title = d.get("media-title") or ""
@@ -2561,8 +3202,13 @@ class MainWindow(QMainWindow):
                        "#e0c06a" if ratio >= 0.85 else "#e08a8a")
                 tail = (f"　<span style='color:{col}'>目标 {tgt:.0f}"
                         f"　达成 {ratio * 100:.0f}%</span>")
-            lines.append(f"<span style='color:{col}'>输出 <b>{avg:.1f} fps</b>"
-                         f"</span>　实际显示 <b>{shown:.1f} fps</b>{tail}")
+            # ★ 「实时」这一项才是**实测**（帧号差分），其余两项是声明值/推算值。
+            #   拿不到实测帧号时整段不出现，输出与原格式逐字一致。
+            _real = (f"<span style='color:{col}'>实时 <b>{real_fps:.1f} fps</b>"
+                     f"</span>　" if real_fps else "")
+            lines.append(f"{_real}<span style='color:{col}'>输出 "
+                         f"<b>{avg:.1f} fps</b></span>　实际显示 "
+                         f"<b>{shown:.1f} fps</b>{tail}")
         dcol = ("#7fd6a0" if drop_rate < 1.0 else
                 "#e0c06a" if drop_rate < 5.0 else "#e08a8a")
         dtag = ("流畅" if drop_rate < 1.0 else
@@ -2573,6 +3219,46 @@ class MainWindow(QMainWindow):
                      f"<span style='color:#8a8a9c'>　→ {res}</span>")
         return "<br>".join(lines)
 
+    def _osd_line(self, d: dict, avg, rate: float, real=None) -> str:
+        """推给 mpv OSD 的那一行**纯文本**（OSD 不认 HTML，别带标签）。
+
+        内容与面板那行一致，只是压成一行、去掉颜色标记。
+        """
+        parts = []
+        if real:
+            parts.append(f"实时 {real:.1f} fps")
+        if avg is not None:
+            parts.append(f"输出 {avg:.1f} fps")
+            parts.append(f"实际显示 {max(avg - rate, 0):.1f} fps"
+                         f"（目标 {self._target_fps:.0f}）")
+        if rate >= 0.05:
+            parts.append(f"丢帧 {rate:.1f}/s（累计 "
+                         f"{d.get('frame-drop-count') or 0}）")
+        ow, oh = d.get("video-out-params/w"), d.get("video-out-params/h")
+        if isinstance(ow, int) and isinstance(oh, int):
+            parts.append(f"{ow}×{oh}")
+        _disp = d.get("display-fps")
+        if (isinstance(_disp, (int, float)) and not isinstance(_disp, bool)
+                and _disp > 1):
+            parts.append(f"屏 {_disp:.0f}Hz")
+        line1 = "　".join(parts)
+        # ★ 第二行：GPU/CPU 利用率、显存、硬件型号（SysStat 后台每秒采集，
+        #   拿不到就整行不出现）。mpv 的 show-text 里 \n 会渲染成换行。
+        snap = self._sys.snapshot if self._sys is not None else {}
+        p2 = []
+        if "gpu_util" in snap:
+            p2.append(f"GPU {snap['gpu_util']}%")
+            mu, mt = snap.get("gpu_mem_used"), snap.get("gpu_mem_total")
+            if mu is not None and mt:
+                p2.append(f"{mu / 1024:.1f}/{mt / 1024:.1f}G")
+            if self._gpu_short:
+                p2.append(self._gpu_short)
+        if "cpu_util" in snap:
+            p2.append(f"CPU {snap['cpu_util']}%")
+            if self._cpu_short:
+                p2.append(self._cpu_short)
+        return line1 + ("\n" + " · ".join(p2) if p2 else "")
+
     def _refresh_live(self) -> None:
         if self.proc.state() == QProcess.NotRunning:
             return
@@ -2582,13 +3268,24 @@ class MainWindow(QMainWindow):
         self._sample(d)
         avg = self._avg_fps()
         rate = self._drop_rate()
-        self.lb_live.setText(self.render_live(d, avg, self._target_fps, rate))
+        real = self._real_fps()
+        self.lb_live.setText(self.render_live(d, avg, self._target_fps, rate,
+                                              real))
+
+        now = time.monotonic()
+        # ★ 每秒把同一行统计推给 mpv 的 OSD（左上角小字）—— 全屏播放时不用切回界面。
+        #   时长给 2.2s（> 1s 间隔）避免闪烁；和 mpv 自己的状态行分两行、互不覆盖。
+        if (self._stat and self._stat.opened and (avg is not None or real is not None)
+                and now - self._last_osd_push >= 1.0):
+            self._last_osd_push = now
+            self._stat.push(["show-text", self._osd_line(d, avg, rate, real),
+                             2200, 3])
 
         # 每 5 秒往日志里留一行，播完还能回查
-        now = time.monotonic()
         if avg is not None and now - self._last_stat_log >= 5.0:
             self._last_stat_log = now
-            self._log(f"[状态] 输出 {avg:.1f} fps · 实际显示"
+            _rt = f"实时 {real:.1f} fps · " if real else ""
+            self._log(f"[状态] {_rt}输出 {avg:.1f} fps · 实际显示"
                       f" {max(avg - rate, 0):.1f} fps（目标"
                       f" {self._target_fps:.0f}）· 丢帧 {rate:.1f}/s"
                       f" · {self._fmt_time(d.get('time-pos'))}"

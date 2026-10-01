@@ -28,7 +28,15 @@ HERE = Path(__file__).resolve().parent
 
 
 def _pick_vs_py() -> Path:
-    """.venv 优先（自包含），回退本机已装的 VapourSynth 解释器。"""
+    """.venv 优先（自包含），回退本机已装的 VapourSynth 解释器。
+
+    ⚠ 返回的是 **python.exe 的完整路径**，不是 python 根目录 —— 调用方全部按
+    文件用（`VS_PY.is_file()` / `subprocess.run([str(VS_PY), ...])`）。
+    2026-10-02 修：原实现返回的是**目录**（`HERE/".venv"`），于是
+    `VS_PY.is_file()` 恒为 False、"VapourSynth 解释器"永远报「找不到」、
+    `VS_PY.parent / "Lib" / "site-packages"` 也退多了一层 —— **整套 VS 检查
+    全废**（表现为 9 项 FAIL，但实际环境是好的）。
+    """
     cands = [HERE / ".venv"]                     # ① 自包含
     # ② 兜底候选（.venv 丢了才有用）
     cands += [
@@ -36,13 +44,14 @@ def _pick_vs_py() -> Path:
         Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Python" / "Python313",
     ]
     for c in cands:
-        if (c / "Lib" / "site-packages" / "vapoursynth" / "vsscript.dll").is_file():
-            return c
-    return cands[0]
+        exe = c / "Scripts" / "python.exe"
+        if exe.is_file() and (c / "Lib" / "site-packages" / "vapoursynth").is_dir():
+            return exe
+    return cands[0] / "Scripts" / "python.exe"
 
 
 VS_PY = _pick_vs_py()
-VS_SP = VS_PY.parent / "Lib" / "site-packages"
+VS_SP = VS_PY.parent.parent / "Lib" / "site-packages"    # python.exe → Scripts → venv 根
 VS_ROOT = VS_SP / "vapoursynth"
 MPV = HERE / "mpv" / "mpv.exe"
 ENGINE_DIR = HERE / "models" / "sr"
@@ -170,6 +179,39 @@ add(WARN if not trtexec.is_file() else OK, "trtexec.exe",
     "缺失（由 trtexec_py.py 用 TensorRT Python API 顶替，补帧/超分都照常）"
     if not trtexec.is_file() else "")
 
+# ---- 3b. TRT 版本一致性（2026-10-02 新增，血的教训）----
+# python 的 `tensorrt` 包 与 vsmlrt-cuda 的 nvinfer_11.dll **必须是同一版本**。
+# 不一致时症状极其隐蔽：
+#   · 超分照常（它只"加载"预编引擎，走 C++ 的 core.trt）
+#   · **补帧崩**（RIFE 要现场编引擎，走 python 的 tensorrt API）——
+#     报 `Assertion validateCaskKLibSize failed`，然后静默跳过补帧
+#   · vstrt 只会打一句 "version mismatch ... fingers crossed"，很容易被忽略
+# 两个 nvinfer_11.dll 同版本时文件大小相同（11.0=375,759,984 / 11.3=401,707,120），
+# 所以比对大小就能发现被换错。
+try:
+    _pyv = "?"
+    try:
+        import tensorrt as _t
+        _pyv = _t.__version__
+    except Exception as _e:                                   # noqa: BLE001
+        _pyv = f"import 失败({type(_e).__name__})"
+    _nv_a = VS_ROOT / "plugins" / "vsmlrt-cuda" / "nvinfer_11.dll"
+    _nv_b = VS_SP / "tensorrt_libs" / "nvinfer_11.dll"
+    if _nv_a.is_file() and _nv_b.is_file():
+        _sa, _sb = _nv_a.stat().st_size, _nv_b.stat().st_size
+        if _sa == _sb:
+            add(OK, "TRT 版本一致性", f"python tensorrt={_pyv}，两处 nvinfer 同版本")
+        else:
+            add(BAD, "TRT 版本一致性",
+                f"python 包={_pyv}；vsmlrt-cuda 与 tensorrt_libs 的 nvinfer_11.dll "
+                f"大小不同（{_sa} / {_sb}）⇒ **补帧会现场编引擎失败**。"
+                f"修法：把两处都换成同一版本（本机锁 11.0.0.114）")
+    else:
+        add(WARN, "TRT 版本一致性",
+            f"python={_pyv}；缺 tensorrt_libs/nvinfer_11.dll 或 vsmlrt-cuda 那份，跳过比对")
+except Exception as _e:                                        # noqa: BLE001
+    add(WARN, "TRT 版本一致性", f"检查异常：{type(_e).__name__}: {str(_e)[:80]}")
+
 # ---- 4. mpv 与 VS 滤镜支持 ----
 if MPV.is_file():
     add(OK, "mpv.exe", str(MPV))
@@ -197,12 +239,16 @@ else:
     add(BAD, "mpv.exe", f"找不到 {MPV}")
 
 # ---- 5. 超分引擎档位 ----
-for tag, pat in (("animevideov3（4x）", "realesr-animevideov3_fp16_*.engine"),
-                 ("realesr-animevideov3_re2x（2x 备选）", "realesr-animevideov3_re2x_fp16_*.engine")):
+# ⚠ 模式必须用 `fp16*_`（`*` 兼容 `_fp16_` 与 `_fp16io_`）—— 2026-10-02 修：
+#   原模式写死 `_fp16_`，而实际引擎早已改名 `_fp16io_`，于是**一个都匹配不到**、
+#   恒报「一个都没有」。
+for tag, pat in (("animevideov3（4x）", "realesr-animevideov3_fp16*_*.engine"),
+                 ("realesr-animevideov3_re2x（2x 备选）", "realesr-animevideov3_re2x_fp16*_*.engine")):
     files = sorted(ENGINE_DIR.glob(pat)) if ENGINE_DIR.is_dir() else []
     # 大于 100MB 的是「胖引擎」（TRT 序列化退化，载入慢一倍多），单独点出来
     fat = [f for f in files if f.stat().st_size > 100 * 2**20]
-    detail = " ".join(f.stem.split("_fp16_")[-1] for f in files) or "一个都没有"
+    detail = " ".join(f.stem.split("_fp16io_")[-1].split("_fp16_")[-1]
+                      for f in files) or "一个都没有"
     if fat:
         detail += f"  ⚠ 胖引擎(>100MB) {[f.name for f in fat]}"
     add(OK if files else BAD, f"超分引擎 {tag}", detail)

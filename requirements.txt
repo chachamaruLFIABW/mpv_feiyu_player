@@ -19,12 +19,17 @@ pillow==12.3.0
 psutil==7.2.2
 imageio-ffmpeg==0.6.0
 
-# TensorRT —— 版本必须与本机 CUDA / 驱动匹配，下面只是本机验证过的组合。
-# 如果你的环境装不上 cu13 系，请按 NVIDIA 官方矩阵换成对应版本。
-tensorrt==11.3.0.99
-tensorrt-cu13==11.3.0.99
-tensorrt-cu13-bindings==11.3.0.99
-tensorrt-cu13-libs==11.3.0.99
+# ★ TensorRT —— 必须锁 11.0.0.114，**不要升到 11.3.0.99**（2026-10-02 实测）。
+#   11.3 有回归：同一条 onnx 会**稳定**编出 1~4 GB 的退化 plan（正常只有 1~8 MB），
+#   `builder_optimization_level` 改 3/4/5 都救不回来；而且引擎序列化格式
+#   11.0=243 / 11.3=244 **不跨版本**，两者不能混用。
+#   配套：`vapoursynth/plugins/vsmlrt-cuda/` 里的 nvinfer / nvinfer_plugin /
+#   nvonnxparser 三个 dll 也必须是 11.0（旧版留在原地并加了 `.trt113bak` 后缀）。
+#   重编超分引擎用 `build_engines_trt110.py`（内含 TRT 版本断言，编错版本会直接报错）。
+tensorrt==11.0.0.114
+tensorrt-cu13==11.0.0.114
+tensorrt-cu13-bindings==11.0.0.114
+tensorrt-cu13-libs==11.0.0.114
 
 # 可选：音频设备 / 回环探测（只在排查音画同步时用到）
 sounddevice==0.5.6
