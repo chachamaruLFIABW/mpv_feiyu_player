@@ -2909,6 +2909,11 @@ class MainWindow(QMainWindow):
         if not mpv.is_file():
             self._log(f"[控制台][X] 找不到 mpv：{mpv}\n")
             return
+        # ★ 防呆：mpv 程序名里没 "mpv" → 很可能填错了（曾把 where.exe 当 mpv 填进去，
+        #   结果 mpv 的参数被当搜索模式报错、直接放不了）。只警告，不强制改。
+        if "mpv" not in mpv.name.lower():
+            self._log(f"[控制台][!] 警告：你设置的「mpv 程序」是 {mpv.name}，"
+                      f"看起来不是 mpv —— 播放/超分可能失败。\n")
         # ★ 外部 mpv 若自带 VSScript.dll（如 mpv-lazy），先临时让它让位，
         #   否则超分链路会被它的 VapourSynth 环境抢走、静默失效。退出时还原。
         self._vs_neutralized = _neutralize_external_vs(mpv)
