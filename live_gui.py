@@ -377,10 +377,13 @@ ABOUT_HTML = """<p><b>作者</b>：bilibili <b>茶茶丸想大摆特摆</b></p>
 自行编译引擎、替换模型、或接入第三方 mpv 构建的风险由使用者自行承担。</p>"""
 
 
+APP_VERSION = "0.1"          # 应用版本号（窗口标题 / 关于 对话框都用它）
+
+
 def show_about(parent) -> None:
-    """标准 About 对话框：图标 + 应用名 + 作者 + 开源/协议声明 + 依赖出处 + 免责。"""
+    """标准 About 对话框：图标 + 应用名 + 版本 + 作者 + 开源/协议声明 + 依赖出处 + 免责。"""
     dlg = QDialog(parent)
-    dlg.setWindowTitle("关于 mpv - feiyuplayer")
+    dlg.setWindowTitle(f"关于 mpv - feiyuplayer v{APP_VERSION}")
     dlg.setWindowIcon(QIcon(str(ROOT / "console.ico")))
     dlg.setMinimumWidth(540)
     dlg.setMinimumHeight(420)
@@ -393,7 +396,8 @@ def show_about(parent) -> None:
     if not pm.isNull():
         ico.setPixmap(pm.scaled(72, 72, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
-    title = QLabel("<b>mpv - feiyuplayer</b>")
+    title = QLabel(f"<b>mpv - feiyuplayer</b>&nbsp;&nbsp;"
+                   f"<span style='color:#8a8a9c;font-size:11pt'>v{APP_VERSION}</span>")
     title.setFont(QFont("", 14))
     sub = QLabel("mpv 实时超分 + 补帧 控制台")
     sub.setStyleSheet("color: #888;")
@@ -1353,7 +1357,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("mpv - feiyuplayer")
+        self.setWindowTitle(f"mpv - feiyuplayer v{APP_VERSION}")
         self.setWindowIcon(QIcon(str(ROOT / "console.ico")))
         # ★ 2026-09-30：按**屏幕可用尺寸**算初始窗口，别写死小尺寸。
         #   本机屏 2560x1400，原来写死的 1260x900 在参数面板加宽到 520 后

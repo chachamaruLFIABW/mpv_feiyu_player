@@ -1,4 +1,4 @@
-# feiyu_player
+# feiyu_player v0.1
 
 > **基于 Real-ESRGAN 和 mpv 的实时超分播放器** —— 边看边超分、边看边补帧，不用先转码、不用等。
 
